@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 삼성 갤럭시 Z 플립 커버 화면(플렉스 윈도우)에 위젯을 올릴 수 있게 함 -->
+<samsung-appwidget-provider display="sub_screen">
+</samsung-appwidget-provider>

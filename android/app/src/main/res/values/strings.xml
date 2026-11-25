@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SafeWave 보호자</string>
+    <string name="widget_desc">어르신 상태를 큰 글씨로 보여줘요. 플립 커버 화면에도 둘 수 있어요.</string>
+</resources>

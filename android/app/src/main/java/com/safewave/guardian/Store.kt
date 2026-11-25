@@ -1,0 +1,398 @@
+package com.safewave.guardian
+
+import android.content.Context
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.IOException
+
+enum class Status { LOADING, NORMAL, EMPTY, GRACE, EMERGENCY, OFFLINE }
+enum class Gate { CHECKING, LOGGED_OUT, PENDING, REJECTED, KICKED, READY, ERROR }
+
+data class Live(
+    val status: Status = Status.LOADING,
+    val graceLeft: Int? = null,
+    val msg: String = "",
+    val test: Boolean = false,
+    val lastSeen: Long = 0L,
+    val acking: Boolean = false,     // 확인 버튼을 눌러서 센서가 정상으로 바뀌기를 기다리는 중
+    val connMsg: String = ""
+) {
+    /** 경보를 울려야 하는 상태 (확인을 보낸 직후는 제외) */
+    val alarming get() = status == Status.EMERGENCY && !acking
+}
+
+data class Contact(val name: String, val rel: String, val phone: String)
+
+/** 함께 사는 분 (같은 센서를 씀) */
+data class Person(
+    val name: String = "", val age: String = "", val sex: String = "여", val blood: String = "",
+    val cond: String = "", val meds: String = "", val mob: String = "", val note: String = ""
+)
+
+data class Profile(
+    val name: String = "어르신", val age: String = "", val sex: String = "", val blood: String = "",
+    val addr: String = "", val cond: String = "", val meds: String = "", val mob: String = "", val note: String = "",
+    val contacts: List<Contact> = emptyList(), val loaded: Boolean = false,
+    val people: List<Person> = emptyList()
+) {
+    /** 경보·상태에 쓰는 이름: 한 분이면 "김영순", 두 분이면 "김영순·박철수", 더 많으면 "김영순 외 2명" */
+    val displayName: String get() {
+        val names = listOf(name) + people.map { it.name }.filter { it.isNotBlank() }
+        return when (names.size) { 1 -> names[0]; 2 -> names.joinToString("·"); else -> "${names[0]} 외 ${names.size - 1}명" }
+    }
+}
+
+data class Me(val name: String, val email: String, val role: String) {
+    /** 관제 사이트와 같이 관리자만 어르신 정보·연락처를 고칠 수 있음 */
+    val canEdit get() = role == "admin"
+    val roleText get() = when (role) { "admin" -> "관리자"; "member" -> "보호자"; "pending" -> "승인 대기"; else -> role }
+}
+
+/** 공지사항 (shared/<노드>/notices/<id>) */
+data class Notice(val id: String, val title: String, val body: String, val by: String, val ts: Long, val pinned: Boolean)
+
+/** kind: ok(초록) wn(주황) cr(빨강) sys(회색) */
+data class Rec(val id: String, val ts: Long, val msg: String, val kind: String)
+
+object Store {
+    val gate = MutableStateFlow(Gate.CHECKING)
+    val gateMsg = MutableStateFlow("")
+    val me = MutableStateFlow<Me?>(null)
+    val live = MutableStateFlow(Live())
+    val profile = MutableStateFlow(Profile())
+    val records = MutableStateFlow<List<Rec>>(emptyList())
+    val fontLevel = MutableStateFlow(1)
+    val testAlarm = MutableStateFlow(false)
+    val silenced = MutableStateFlow(false)
+    val notices = MutableStateFlow<List<Notice>>(emptyList())
+
+    @Volatile private var ackUntil = 0L
+    private var node: JSONObject? = null
+    private var lastUp: String? = null
+    private var lastUpAt = 0L
+    private var connMsg = ""
+
+    fun reset() {
+        synchronized(this) { node = null; lastUp = null; lastUpAt = 0L; ackUntil = 0L }
+        me.value = null; live.value = Live(); profile.value = Profile(); records.value = emptyList()
+    }
+
+    // ---------------- 실시간 센서 상태 ----------------
+    /** nodes/<노드> 실시간 스트림 이벤트 (put / patch) */
+    fun onStreamEvent(type: String, data: String) {
+        val m = runCatching { JSONObject(data) }.getOrNull() ?: return
+        val path = m.optString("path", "/")
+        val d = m.opt("data")
+        synchronized(this) {
+            if (path == "/" && type == "put") {
+                node = d as? JSONObject ?: JSONObject()
+            } else {
+                val n = node ?: JSONObject().also { node = it }
+                val keys = path.trim('/').split('/').filter { it.isNotEmpty() }
+                if (keys.isEmpty()) {
+                    if (d is JSONObject) d.keys().forEach { k -> n.put(k, d.get(k)) }
+                } else {
+                    var cur = n
+                    for (k in keys.dropLast(1)) {
+                        cur = cur.optJSONObject(k) ?: JSONObject().also { cur.put(k, it) }
+                    }
+                    val last = keys.last()
+                    if (type == "patch" && d is JSONObject) {
+                        val target = cur.optJSONObject(last) ?: JSONObject().also { cur.put(last, it) }
+                        d.keys().forEach { k -> target.put(k, d.get(k)) }
+                    } else if (d == null || d == JSONObject.NULL) cur.remove(last)
+                    else cur.put(last, d)
+                }
+            }
+            // 센서는 몇 초마다 up 값을 바꿈. 처음 받은 값은 오래된 것일 수 있어 다음 변화부터 살아 있다고 봄 (사이트와 같은 방식)
+            val up = node?.opt("up")?.toString()
+            if (up != null && up != lastUp) {
+                lastUpAt = if (lastUp == null) 0L else System.currentTimeMillis()
+                lastUp = up
+            }
+        }
+        recompute()
+    }
+
+    fun setConnection(ok: Boolean, msg: String?) {
+        connMsg = if (ok) "" else (msg ?: "")
+        recompute()
+    }
+
+    @Synchronized
+    fun recompute() {
+        val now = System.currentTimeMillis()
+        val n = node
+        if (n == null) {
+            live.value = Live(status = Status.LOADING, connMsg = connMsg)
+            return
+        }
+        val online = lastUpAt > 0 && now - lastUpAt < Config.OFFLINE_AFTER_MS
+        val st = n.optString("state", "normal")
+        val status = when {
+            !online && lastUp != null && now - startedAt < Config.OFFLINE_AFTER_MS -> Status.LOADING
+            !online -> Status.OFFLINE
+            st == "emergency" -> Status.EMERGENCY
+            st == "grace" -> Status.GRACE
+            st == "empty" -> Status.EMPTY
+            else -> Status.NORMAL
+        }
+        if (ackUntil > 0 && (status == Status.NORMAL || status == Status.EMPTY || now > ackUntil)) ackUntil = 0L
+        val gl = n.opt("graceLeft")
+        live.value = Live(
+            status = status,
+            graceLeft = (gl as? Number)?.toInt() ?: gl?.toString()?.toDoubleOrNull()?.toInt(),
+            msg = n.optString("msg", ""),
+            test = n.optBoolean("sim", false) || n.optBoolean("test", false),
+            lastSeen = lastUpAt,
+            acking = ackUntil > 0 && (status == Status.EMERGENCY || status == Status.GRACE),
+            connMsg = connMsg
+        )
+    }
+    private val startedAt = System.currentTimeMillis()
+
+    // ---------------- 계정 ----------------
+    /** 로그인 상태와 권한 확인. 처음 로그인한 계정은 users/<uid> 에 승인 대기로 등록 (사이트와 같은 방식) */
+    suspend fun loadMe(ctx: Context, joinName: String? = null): Gate = withContext(Dispatchers.IO) {
+        val p = Prefs(ctx)
+        val g: Gate = try {
+            val uid = Auth.uid(ctx)
+            if (uid == null || !Auth.hasSaved(ctx)) Gate.LOGGED_OUT
+            else {
+                Auth.token(ctx)
+                val body = Db.get(ctx, "/users/$uid")
+                val found: JSONObject? = if (body.trim() == "null") null else JSONObject(body)
+                val j: JSONObject = found ?: run {
+                    val email = Auth.email(ctx)
+                    val name = joinName?.takeIf { it.isNotBlank() } ?: p.name ?: email.substringBefore('@')
+                    val nj = JSONObject().put("name", name).put("email", email).put("role", "pending")
+                        .put("at", JSONObject().put(".sv", "timestamp"))
+                    Db.put(ctx, "/users/$uid", nj.toString())
+                    nj
+                }
+                val m = Me(j.optString("name"), j.optString("email"), j.optString("role"))
+                me.value = m
+                p.name = m.name
+                gateMsg.value = ""
+                when (m.role) {
+                    "admin", "member" -> Gate.READY
+                    "rejected" -> Gate.REJECTED
+                    "kicked" -> Gate.KICKED
+                    else -> Gate.PENDING
+                }
+            }
+        } catch (e: AuthException) {
+            gateMsg.value = e.message ?: ""
+            if (e.message?.contains("만료") == true || e.message?.contains("로그인이 필요") == true) {
+                Auth.signOut(ctx); Gate.LOGGED_OUT
+            } else Gate.ERROR
+        } catch (e: IOException) {
+            gateMsg.value = "인터넷 연결을 확인해 주세요."
+            Gate.ERROR
+        } catch (e: Exception) {
+            gateMsg.value = "오류가 발생했습니다: ${e.message}"
+            Gate.ERROR
+        }
+        gate.value = g
+        g
+    }
+
+    // ---------------- 대상자 정보 (사이트의 shared/<노드>/profile) ----------------
+    suspend fun refreshShared(ctx: Context) = withContext(Dispatchers.IO) {
+        runCatching {
+            val body = Db.get(ctx, "/shared/${Prefs(ctx).node}")
+            if (body.trim() == "null") return@runCatching
+            val doc = JSONObject(body)
+            notices.value = parseNotices(doc.optJSONObject("notices"))
+            val people = parsePeople(doc.opt("people"))
+            val pj = doc.optJSONObject("profile")
+            profile.value = (if (pj != null) parseProfile(pj) else profile.value).copy(people = people)
+        }
+    }
+
+    private fun parseNotices(j: JSONObject?): List<Notice> {
+        if (j == null) return emptyList()
+        return j.keys().asSequence().mapNotNull { k ->
+            val o = j.optJSONObject(k) ?: return@mapNotNull null
+            val title = o.optString("title").trim()
+            if (title.isEmpty()) null
+            else Notice(k, title, o.optString("body").trim(), o.optString("by").takeIf { it != "null" }.orEmpty(),
+                o.optLong("ts", 0L), o.optBoolean("pinned", false))
+        }.sortedWith(compareByDescending<Notice> { it.pinned }.thenByDescending { it.ts }).toList()
+    }
+
+    /** 공지 쓰기·고치기 (id 가 없으면 새 글). 성공하면 null */
+    suspend fun saveNotice(ctx: Context, old: Notice?, title: String, text: String, pinned: Boolean): String? =
+        writeNotice(ctx, old?.id ?: "n${System.currentTimeMillis()}",
+            JSONObject().put("title", title).put("body", text).put("pinned", pinned)
+                .put("by", me.value?.name?.takeIf { it.isNotEmpty() } ?: JSONObject.NULL)
+                .put("ts", if (old != null && old.ts > 0) old.ts else JSONObject().put(".sv", "timestamp")),
+            if (old == null) "공지사항 등록: $title" else "공지사항 수정: $title")
+
+    suspend fun deleteNotice(ctx: Context, n: Notice): String? = writeNotice(ctx, n.id, JSONObject.NULL, "공지사항 삭제: ${n.title}")
+
+    private suspend fun writeNotice(ctx: Context, id: String, value: Any, what: String): String? = withContext(Dispatchers.IO) {
+        try {
+            val nodeId = Prefs(ctx).node
+            Db.patch(ctx, "/shared/$nodeId", JSONObject().put("notices/$id", value).toString())
+            val who = me.value?.name.orEmpty()
+            val log = JSONObject().put("msg", "$what (앱)" + if (who.isNotEmpty()) " · $who" else "")
+                .put("cls", "sys").put("by", if (who.isEmpty()) JSONObject.NULL else who).put("ts", JSONObject().put(".sv", "timestamp"))
+            runCatching { Db.post(ctx, "/logs/$nodeId", log.toString()) }
+            refreshShared(ctx)
+            null
+        } catch (e: AuthException) {
+            "공지를 쓸 권한이 없어요. 관리자 계정으로 로그인해 주세요."
+        } catch (e: Exception) {
+            "저장하지 못했어요. 인터넷을 확인하고 다시 해 주세요."
+        }
+    }
+
+    private fun parsePeople(v: Any?): List<Person> {
+        val arr = when (v) {
+            is JSONArray -> (0 until v.length()).mapNotNull { v.optJSONObject(it) }
+            is JSONObject -> v.keys().asSequence().mapNotNull { v.optJSONObject(it) }.toList()   // 배열이 객체로 올 때
+            else -> emptyList()
+        }
+        return arr.map { o ->
+            fun s(k: String) = o.opt(k)?.takeIf { it != JSONObject.NULL }?.toString()?.trim().orEmpty()
+            Person(s("name"), s("age"), s("sex").ifEmpty { "여" }, s("blood"), s("cond"), s("meds"), s("mob"), s("note"))
+        }.filter { it.name.isNotEmpty() }
+    }
+
+    private fun parseProfile(j: JSONObject): Profile {
+        val cs = mutableListOf<Contact>()
+        val arr: JSONArray? = j.optJSONArray("contacts")
+        if (arr != null) for (i in 0 until arr.length()) {
+            val c = arr.optJSONObject(i) ?: continue
+            val name = c.optString("name").trim()
+            val phone = c.optString("phone").trim()
+            if (name.isNotEmpty() || phone.isNotEmpty()) cs += Contact(name, c.optString("rel").trim(), phone)
+        }
+        fun s(k: String) = j.opt(k)?.takeIf { it != JSONObject.NULL }?.toString()?.trim().orEmpty()
+        return Profile(
+            name = s("name").ifEmpty { "어르신" }, age = s("age"), sex = s("sex"), blood = s("blood"),
+            addr = s("addr"), cond = s("cond"), meds = s("meds"), mob = s("mob"), note = s("note"),
+            contacts = cs, loaded = true
+        )
+    }
+
+    /**
+     * 어르신 정보·연락처 저장. 사이트와 같은 shared/<노드>/profile 에 저장해서 사이트 화면에도 바로 반영됨.
+     * 성공하면 null, 실패하면 안내 문구
+     */
+    suspend fun saveProfile(ctx: Context, np: Profile, what: String): String? = withContext(Dispatchers.IO) {
+        try {
+            val nodeId = Prefs(ctx).node
+            val contacts = JSONArray()
+            np.contacts.forEach { contacts.put(JSONObject().put("name", it.name).put("rel", it.rel).put("phone", it.phone)) }
+            val pj = JSONObject()
+                .put("name", np.name).put("age", np.age.trim().toIntOrNull() ?: np.age.trim())
+                .put("sex", np.sex).put("blood", np.blood).put("addr", np.addr).put("cond", np.cond)
+                .put("meds", np.meds).put("mob", np.mob).put("note", np.note).put("contacts", contacts)
+            val who = me.value?.name.orEmpty()
+            val whoJson: Any = if (who.isEmpty()) JSONObject.NULL else who
+            val body = JSONObject().put("profile", pj).put("by", whoJson).put("at", JSONObject().put(".sv", "timestamp"))
+            Db.patch(ctx, "/shared/$nodeId", body.toString())
+            profile.value = np.copy(loaded = true, people = profile.value.people)
+            val log = JSONObject().put("msg", "$what 저장 (앱)" + if (who.isNotEmpty()) " · $who" else "")
+                .put("cls", "sys").put("by", whoJson).put("ts", JSONObject().put(".sv", "timestamp"))
+            runCatching { Db.post(ctx, "/logs/$nodeId", log.toString()) }
+            null
+        } catch (e: AuthException) {
+            "수정할 권한이 없어요. 관리자 계정으로 로그인해 주세요."
+        } catch (e: Exception) {
+            "저장하지 못했어요. 인터넷을 확인하고 다시 해 주세요."
+        }
+    }
+
+    /** 함께 사는 분 목록 저장 (shared/<노드>/people). 사이트가 profile 을 저장해도 지워지지 않게 따로 둠 */
+    suspend fun savePeople(ctx: Context, list: List<Person>, what: String): String? = withContext(Dispatchers.IO) {
+        try {
+            val nodeId = Prefs(ctx).node
+            val arr = JSONArray()
+            list.forEach {
+                arr.put(JSONObject().put("name", it.name).put("age", it.age.toIntOrNull() ?: it.age).put("sex", it.sex)
+                    .put("blood", it.blood).put("cond", it.cond).put("meds", it.meds).put("mob", it.mob).put("note", it.note))
+            }
+            val who = me.value?.name.orEmpty()
+            val whoJson: Any = if (who.isEmpty()) JSONObject.NULL else who
+            val body = JSONObject().put("people", if (list.isEmpty()) JSONObject.NULL else arr)
+                .put("by", whoJson).put("at", JSONObject().put(".sv", "timestamp"))
+            Db.patch(ctx, "/shared/$nodeId", body.toString())
+            profile.value = profile.value.copy(people = list)
+            val log = JSONObject().put("msg", "$what (앱)" + if (who.isNotEmpty()) " · $who" else "")
+                .put("cls", "sys").put("by", whoJson).put("ts", JSONObject().put(".sv", "timestamp"))
+            runCatching { Db.post(ctx, "/logs/$nodeId", log.toString()) }
+            null
+        } catch (e: AuthException) {
+            "수정할 권한이 없어요. 관리자 계정으로 로그인해 주세요."
+        } catch (e: Exception) {
+            "저장하지 못했어요. 인터넷을 확인하고 다시 해 주세요."
+        }
+    }
+
+    // ---------------- 기록 (레이더 이벤트 + 사이트 공유 기록) ----------------
+    suspend fun refreshRecords(ctx: Context) = withContext(Dispatchers.IO) {
+        val nodeId = Prefs(ctx).node
+        val q = "&orderBy=%22%24key%22&limitToLast=40"
+        val out = mutableListOf<Rec>()
+        runCatching {
+            val b = Db.get(ctx, "/events", q)
+            if (b.trim() != "null") {
+                val j = JSONObject(b)
+                j.keys().forEach { k ->
+                    val d = j.optJSONObject(k) ?: return@forEach
+                    val n = d.optString("node", "")
+                    if (n.isNotEmpty() && n != nodeId) return@forEach
+                    val msg = d.optString("msg", "")
+                    if (msg.isEmpty()) return@forEach
+                    val kind = when (d.optString("tag")) {
+                        "grace" -> "wn"; "emergency" -> "cr"
+                        "response", "ack", "clear", "enter" -> "ok"
+                        else -> "sys"
+                    }
+                    out += Rec("ev:$k", d.optLong("ts", 0L), msg, kind)
+                }
+            }
+        }
+        runCatching {
+            val b = Db.get(ctx, "/logs/$nodeId", q)
+            if (b.trim() != "null") {
+                val j = JSONObject(b)
+                j.keys().forEach { k ->
+                    val d = j.optJSONObject(k) ?: return@forEach
+                    val msg = d.optString("msg", "")
+                    if (msg.isEmpty()) return@forEach
+                    out += Rec("lg:$k", d.optLong("ts", 0L), msg, d.optString("cls", "sys"))
+                }
+            }
+        }
+        if (out.isNotEmpty() || records.value.isEmpty()) records.value = out.sortedByDescending { it.ts }.take(60)
+    }
+
+    // ---------------- 확인(알람 끄기) ----------------
+    /** 사이트의 "보호자 확인" 과 똑같이 cmd/<노드> 에 "ACK" 를 보내고 공유 기록을 남김 */
+    suspend fun ack(ctx: Context): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val nodeId = Prefs(ctx).node
+            Db.put(ctx, "/cmd/$nodeId", "\"ACK\"")
+            ackUntil = System.currentTimeMillis() + 8_000L
+            silenced.value = true
+            val name = me.value?.name.orEmpty()
+            val body = JSONObject()
+                .put("msg", "보호자 확인 버튼 누름 (앱)" + if (name.isNotEmpty()) " · $name" else "")
+                .put("cls", "ok")
+                .put("by", if (name.isEmpty()) JSONObject.NULL else name)
+                .put("ts", JSONObject().put(".sv", "timestamp"))
+            runCatching { Db.post(ctx, "/logs/$nodeId", body.toString()) }
+            recompute()
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+}
