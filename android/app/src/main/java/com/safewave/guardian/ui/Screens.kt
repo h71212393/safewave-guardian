@@ -194,8 +194,9 @@ fun WaitScreen(title: String, desc: String, onRetry: (() -> Unit)?, onLogout: ()
 
 // ---------------- 홈 ----------------
 @Composable
-fun StatusCard(l: Live, name: String, onAck: () -> Unit, ackBusy: Boolean) {
+fun StatusCard(l: Live, name: String, onAck: () -> Unit, ackBusy: Boolean, goer: String? = null, onGo: (() -> Unit)? = null) {
     val k = look(l, name)
+    val urgent = l.status == Status.EMERGENCY || l.status == Status.GRACE
     Column(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(26.dp)).background(k.color).padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -203,6 +204,8 @@ fun StatusCard(l: Live, name: String, onAck: () -> Unit, ackBusy: Boolean) {
         Icon(k.icon, null, tint = Color.White, modifier = Modifier.size(72.dp))
         Text(k.title, fontSize = 40.sp, fontWeight = FontWeight.ExtraBold, color = Color.White, lineHeight = 48.sp)
         Text(k.sub, fontSize = 23.sp, color = Color.White, lineHeight = 32.sp)
+        if (urgent && l.room.isNotEmpty()) Text("장소: ${l.room}", fontSize = 26.sp, fontWeight = FontWeight.ExtraBold, color = Color.White)
+        if (urgent) GoBox(goer, onGo, k.color)
         if (l.test) Text("※ 사이트에서 시험 중입니다 (실제 낙상 아님)", fontSize = 18.sp, color = Color.White, fontWeight = FontWeight.Bold)
         if (l.status == Status.OFFLINE && l.lastSeen > 0) Text("마지막 신호: ${timeText(l.lastSeen)}", fontSize = 19.sp, color = Color.White)
         if (l.connMsg.isNotEmpty() && (l.status == Status.OFFLINE || l.status == Status.LOADING)) Text(l.connMsg, fontSize = 18.sp, color = Color.White)
@@ -218,12 +221,13 @@ fun StatusCard(l: Live, name: String, onAck: () -> Unit, ackBusy: Boolean) {
 fun HomeScreen(
     l: Live, p: Profile, recs: List<Rec>, ackBusy: Boolean, ackMsg: String,
     onAck: () -> Unit, onCall: (Contact) -> Unit, on119: () -> Unit, onInfo: () -> Unit, onRecords: () -> Unit,
-    newNotice: com.safewave.guardian.Notice? = null, onNotice: () -> Unit = {}
+    newNotice: com.safewave.guardian.Notice? = null, onNotice: () -> Unit = {},
+    goer: String? = null, onGo: (() -> Unit)? = null
 ) {
     Page {
         if (newNotice != null) NewNoticeBanner(newNotice, onNotice)
         Text("${p.displayName} 님", fontSize = 30.sp, fontWeight = FontWeight.ExtraBold, color = C.ink)
-        StatusCard(l, p.displayName, onAck, ackBusy)
+        StatusCard(l, p.displayName, onAck, ackBusy, goer, onGo)
         if (ackMsg.isNotEmpty()) Body(ackMsg, color = if (ackMsg.startsWith("확인")) C.ok else C.crit)
         val first = p.contacts.firstOrNull { it.phone.isNotBlank() }
         if (first != null) BigButton("${first.rel.ifEmpty { first.name }}에게 전화", { onCall(first) }, color = C.ok, icon = Icons.Default.Phone)
@@ -606,7 +610,8 @@ private fun SwitchRow(title: String, desc: String, checked: Boolean, onChange: (
 @Composable
 fun EmergencyScreen(
     name: String, test: Boolean, ackBusy: Boolean, first: Contact?,
-    onAck: () -> Unit, onSilence: () -> Unit, onCall: (Contact) -> Unit, on119: () -> Unit
+    onAck: () -> Unit, onSilence: () -> Unit, onCall: (Contact) -> Unit, on119: () -> Unit,
+    room: String = "", goer: String? = null, onGo: (() -> Unit)? = null
 ) {
     Column(
         Modifier.fillMaxSize().background(C.crit).verticalScroll(rememberScrollState()).padding(24.dp),
@@ -617,6 +622,8 @@ fun EmergencyScreen(
         Text(if (test) "시험 경보" else "긴급!", fontSize = 52.sp, fontWeight = FontWeight.ExtraBold, color = Color.White)
         Text(if (test) "실제 상황이 아니에요. 경보가 잘 울리는지 시험하는 중이에요."
              else if (multi()) "$name 님 댁에서\n낙상이 감지됐어요.\n움직임이 없어요." else "$name 님이 넘어지셨어요.\n움직이지 않으세요.", fontSize = 28.sp, color = Color.White, lineHeight = 38.sp)
+        if (!test && room.isNotEmpty()) Text("장소: $room", fontSize = 34.sp, fontWeight = FontWeight.ExtraBold, color = Color.White)
+        if (!test) GoBox(goer, onGo, C.crit)
         BigButton(if (ackBusy) "보내는 중..." else "확인했어요 (알람 끄기)", onAck, Modifier.heightIn(min = 96.dp),
             color = Color.White, contentColor = C.crit, icon = Icons.Default.Check, enabled = !ackBusy)
         if (first != null) BigButton("${first.rel.ifEmpty { first.name }}에게 전화", { onCall(first) }, color = Color(0xFF7F1D1D), icon = Icons.Default.Phone)

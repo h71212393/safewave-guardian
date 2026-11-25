@@ -18,7 +18,9 @@ data class Live(
     val test: Boolean = false,
     val lastSeen: Long = 0L,
     val acking: Boolean = false,     // 확인 버튼을 눌러서 센서가 정상으로 바뀌기를 기다리는 중
-    val connMsg: String = ""
+    val connMsg: String = "",
+    val node: String = "",           // 어느 센서 (daegu-102-1 …)
+    val room: String = ""            // 방 이름 (거실·큰방)
 ) {
     /** 경보를 울려야 하는 상태 (확인을 보낸 직후는 제외) */
     val alarming get() = status == Status.EMERGENCY && !acking
@@ -57,6 +59,12 @@ data class Notice(val id: String, val title: String, val body: String, val by: S
 /** kind: ok(초록) wn(주황) cr(빨강) sys(회색) */
 data class Rec(val id: String, val ts: Long, val msg: String, val kind: String)
 
+/** 집에 있는 레이더 센서 (관제 사이트와 같은 이름) */
+object Rooms {
+    val list = listOf("daegu-102-1" to "거실", "daegu-102-2" to "큰방")
+    fun name(id: String) = list.firstOrNull { it.first == id }?.second ?: id
+}
+
 object Store {
     val gate = MutableStateFlow(Gate.CHECKING)
     val gateMsg = MutableStateFlow("")
@@ -68,29 +76,44 @@ object Store {
     val testAlarm = MutableStateFlow(false)
     val silenced = MutableStateFlow(false)
     val notices = MutableStateFlow<List<Notice>>(emptyList())
+    /** 방별 상태 (거실·큰방). live 는 이 중 가장 급한 상태 */
+    val rooms = MutableStateFlow<Map<String, Live>>(emptyMap())
+    /** 이번 경보에서 "내가 갈게요" 를 누른 보호자 이름 ("나" 면 이 휴대폰) */
+    val goer = MutableStateFlow<String?>(null)
+    /** AI 탭 (탭을 오가도 남아 있게 여기 둠) */
+    val aiSummary = MutableStateFlow("")
+    val aiChat = MutableStateFlow<List<Pair<Boolean, String>>>(emptyList())   // (내가 보낸 것, 글)
 
-    @Volatile private var ackUntil = 0L
-    private var node: JSONObject? = null
-    private var lastUp: String? = null
-    private var lastUpAt = 0L
-    private var connMsg = ""
+    /** 센서 하나의 실시간 데이터 */
+    private class Buf {
+        var node: JSONObject? = null
+        var lastUp: String? = null
+        var lastUpAt = 0L
+        var ackUntil = 0L
+        var connMsg = ""
+    }
+    private val bufs = HashMap<String, Buf>()
+    private fun buf(id: String) = bufs.getOrPut(id) { Buf() }
+    private var incidentAt = 0L
 
     fun reset() {
-        synchronized(this) { node = null; lastUp = null; lastUpAt = 0L; ackUntil = 0L }
-        me.value = null; live.value = Live(); profile.value = Profile(); records.value = emptyList()
+        synchronized(this) { bufs.clear(); incidentAt = 0L }
+        me.value = null; live.value = Live(); rooms.value = emptyMap(); profile.value = Profile(); records.value = emptyList()
+        goer.value = null; aiSummary.value = ""; aiChat.value = emptyList()
     }
 
     // ---------------- 실시간 센서 상태 ----------------
     /** nodes/<노드> 실시간 스트림 이벤트 (put / patch) */
-    fun onStreamEvent(type: String, data: String) {
+    fun onStreamEvent(nodeId: String, type: String, data: String) {
         val m = runCatching { JSONObject(data) }.getOrNull() ?: return
         val path = m.optString("path", "/")
         val d = m.opt("data")
         synchronized(this) {
+            val b = buf(nodeId)
             if (path == "/" && type == "put") {
-                node = d as? JSONObject ?: JSONObject()
+                b.node = d as? JSONObject ?: JSONObject()
             } else {
-                val n = node ?: JSONObject().also { node = it }
+                val n = b.node ?: JSONObject().also { b.node = it }
                 val keys = path.trim('/').split('/').filter { it.isNotEmpty() }
                 if (keys.isEmpty()) {
                     if (d is JSONObject) d.keys().forEach { k -> n.put(k, d.get(k)) }
@@ -108,51 +131,113 @@ object Store {
                 }
             }
             // 센서는 몇 초마다 up 값을 바꿈. 처음 받은 값은 오래된 것일 수 있어 다음 변화부터 살아 있다고 봄 (사이트와 같은 방식)
-            val up = node?.opt("up")?.toString()
-            if (up != null && up != lastUp) {
-                lastUpAt = if (lastUp == null) 0L else System.currentTimeMillis()
-                lastUp = up
+            val up = b.node?.opt("up")?.toString()
+            if (up != null && up != b.lastUp) {
+                b.lastUpAt = if (b.lastUp == null) 0L else System.currentTimeMillis()
+                b.lastUp = up
             }
         }
         recompute()
     }
 
-    fun setConnection(ok: Boolean, msg: String?) {
-        connMsg = if (ok) "" else (msg ?: "")
+    fun setConnection(nodeId: String, ok: Boolean, msg: String?) {
+        synchronized(this) { buf(nodeId).connMsg = if (ok) "" else (msg ?: "") }
         recompute()
     }
 
-    @Synchronized
-    fun recompute() {
-        val now = System.currentTimeMillis()
-        val n = node
-        if (n == null) {
-            live.value = Live(status = Status.LOADING, connMsg = connMsg)
-            return
-        }
-        val online = lastUpAt > 0 && now - lastUpAt < Config.OFFLINE_AFTER_MS
+    private fun liveOf(id: String, room: String, b: Buf, now: Long): Live {
+        val n = b.node ?: return Live(status = Status.LOADING, connMsg = b.connMsg, node = id, room = room)
+        val online = b.lastUpAt > 0 && now - b.lastUpAt < Config.OFFLINE_AFTER_MS
         val st = n.optString("state", "normal")
         val status = when {
-            !online && lastUp != null && now - startedAt < Config.OFFLINE_AFTER_MS -> Status.LOADING
+            !online && b.lastUp != null && now - startedAt < Config.OFFLINE_AFTER_MS -> Status.LOADING
             !online -> Status.OFFLINE
             st == "emergency" -> Status.EMERGENCY
             st == "grace" -> Status.GRACE
             st == "empty" -> Status.EMPTY
             else -> Status.NORMAL
         }
-        if (ackUntil > 0 && (status == Status.NORMAL || status == Status.EMPTY || now > ackUntil)) ackUntil = 0L
+        if (b.ackUntil > 0 && (status == Status.NORMAL || status == Status.EMPTY || now > b.ackUntil)) b.ackUntil = 0L
         val gl = n.opt("graceLeft")
-        live.value = Live(
+        return Live(
             status = status,
             graceLeft = (gl as? Number)?.toInt() ?: gl?.toString()?.toDoubleOrNull()?.toInt(),
             msg = n.optString("msg", ""),
             test = n.optBoolean("sim", false) || n.optBoolean("test", false),
-            lastSeen = lastUpAt,
-            acking = ackUntil > 0 && (status == Status.EMERGENCY || status == Status.GRACE),
-            connMsg = connMsg
+            lastSeen = b.lastUpAt,
+            acking = b.ackUntil > 0 && (status == Status.EMERGENCY || status == Status.GRACE),
+            connMsg = b.connMsg, node = id, room = room
         )
     }
+
+    /** 여러 방 중 어느 상태를 대표로 보여 줄지 (급한 것 먼저, 그다음 사람이 있는 방) */
+    private fun rank(l: Live) = when (l.status) {
+        Status.EMERGENCY -> if (l.acking) 9 else 10
+        Status.GRACE -> if (l.acking) 7 else 8
+        Status.NORMAL -> 5
+        Status.EMPTY -> 4
+        Status.LOADING -> 3
+        Status.OFFLINE -> 2
+    }
+
+    @Synchronized
+    fun recompute() {
+        val now = System.currentTimeMillis()
+        val map = LinkedHashMap<String, Live>()
+        for ((id, room) in Rooms.list) map[id] = liveOf(id, room, buf(id), now)
+        rooms.value = map
+        val best = map.values.maxByOrNull { rank(it) } ?: Live()
+        // 경보가 시작된 시각 ("내가 갈게요" 는 이 뒤의 것만 봄)
+        val urgent = best.status == Status.EMERGENCY || best.status == Status.GRACE
+        if (urgent && incidentAt == 0L) incidentAt = now
+        if (!urgent && incidentAt != 0L) { incidentAt = 0L; goer.value = null }
+        live.value = best
+    }
     private val startedAt = System.currentTimeMillis()
+
+    // ---------------- 내가 갈게요 ----------------
+    /** 경보 중에 "내가 갈게요" → 공유 기록에 남겨서 다른 보호자 앱·관제 사이트에 보임 */
+    suspend fun go(ctx: Context): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val l = live.value
+            val nodeId = l.node.ifEmpty { Prefs(ctx).node }
+            val name = me.value?.name.orEmpty()
+            val body = JSONObject()
+                .put("msg", "내가 갈게요" + (if (l.room.isNotEmpty()) " (${l.room})" else "") + (if (name.isNotEmpty()) " · $name" else "") + " (앱)")
+                .put("cls", "ok").put("go", true)
+                .put("uid", Auth.uid(ctx) ?: JSONObject.NULL)
+                .put("by", if (name.isEmpty()) JSONObject.NULL else name)
+                .put("ts", JSONObject().put(".sv", "timestamp"))
+            Db.post(ctx, "/logs/$nodeId", body.toString())
+            goer.value = "나"
+            silenced.value = true
+            true
+        } catch (e: Exception) { false }
+    }
+
+    /** 다른 보호자가 "내가 갈게요" 를 눌렀는지 확인 (경보 중에만 부름) */
+    suspend fun checkGo(ctx: Context) = withContext(Dispatchers.IO) {
+        val since = incidentAt
+        if (since == 0L) return@withContext
+        val myUid = Auth.uid(ctx)
+        runCatching {
+            var best: Pair<Long, String>? = null
+            for ((id, _) in Rooms.list) {
+                val b = Db.get(ctx, "/logs/$id", "&orderBy=%22%24key%22&limitToLast=8")
+                if (b.trim() == "null") continue
+                val j = JSONObject(b)
+                j.keys().forEach { k ->
+                    val d = j.optJSONObject(k) ?: return@forEach
+                    if (!d.optBoolean("go", false)) return@forEach
+                    val ts = d.optLong("ts", 0L)
+                    if (ts < since - 60_000L) return@forEach   // 이번 경보 전 것은 무시 (시계 차이 1분 여유)
+                    val who = if (myUid != null && d.optString("uid") == myUid) "나" else d.optString("by").takeIf { it.isNotEmpty() && it != "null" } ?: "다른 보호자"
+                    if (best == null || ts < best!!.first) best = ts to who   // 먼저 누른 사람
+                }
+            }
+            best?.let { if (incidentAt != 0L) goer.value = it.second }
+        }
+    }
 
     // ---------------- 계정 ----------------
     /** 로그인 상태와 권한 확인. 처음 로그인한 계정은 users/<uid> 에 승인 대기로 등록 (사이트와 같은 방식) */
@@ -336,63 +421,68 @@ object Store {
     }
 
     // ---------------- 기록 (레이더 이벤트 + 사이트 공유 기록) ----------------
+    /** 거실·큰방 기록을 합쳐서 최신순으로 (앞에 방 이름을 붙임) */
     suspend fun refreshRecords(ctx: Context) = withContext(Dispatchers.IO) {
-        val nodeId = Prefs(ctx).node
+        val ids = Rooms.list.map { it.first }
+        val main = ids.first()
         val q = "&orderBy=%22%24key%22&limitToLast=40"
         val out = mutableListOf<Rec>()
         runCatching {
-            val b = Db.get(ctx, "/events", q)
+            val b = Db.get(ctx, "/events", "&orderBy=%22%24key%22&limitToLast=60")
             if (b.trim() != "null") {
                 val j = JSONObject(b)
                 j.keys().forEach { k ->
                     val d = j.optJSONObject(k) ?: return@forEach
-                    val n = d.optString("node", "")
-                    if (n.isNotEmpty() && n != nodeId) return@forEach
-                    val msg = d.optString("msg", "")
+                    val n = d.optString("node", "").ifEmpty { main }
+                    if (n !in ids) return@forEach
+                    val msg = d.optString("msg", "").removePrefix("[레이더] ")
                     if (msg.isEmpty()) return@forEach
                     val kind = when (d.optString("tag")) {
                         "grace" -> "wn"; "emergency" -> "cr"
                         "response", "ack", "clear", "enter" -> "ok"
                         else -> "sys"
                     }
-                    out += Rec("ev:$k", d.optLong("ts", 0L), msg, kind)
+                    out += Rec("ev:$k", d.optLong("ts", 0L), "${Rooms.name(n)} · $msg", kind)
                 }
             }
         }
-        runCatching {
-            val b = Db.get(ctx, "/logs/$nodeId", q)
+        for (id in ids) runCatching {
+            val b = Db.get(ctx, "/logs/$id", q)
             if (b.trim() != "null") {
                 val j = JSONObject(b)
                 j.keys().forEach { k ->
                     val d = j.optJSONObject(k) ?: return@forEach
                     val msg = d.optString("msg", "")
                     if (msg.isEmpty()) return@forEach
-                    out += Rec("lg:$k", d.optLong("ts", 0L), msg, d.optString("cls", "sys"))
+                    out += Rec("lg:$id:$k", d.optLong("ts", 0L), "${Rooms.name(id)} · $msg", d.optString("cls", "sys"))
                 }
             }
         }
-        if (out.isNotEmpty() || records.value.isEmpty()) records.value = out.sortedByDescending { it.ts }.take(60)
+        if (out.isNotEmpty() || records.value.isEmpty()) records.value = out.sortedByDescending { it.ts }.take(80)
     }
 
     // ---------------- 확인(알람 끄기) ----------------
     /** 사이트의 "보호자 확인" 과 똑같이 cmd/<노드> 에 "ACK" 를 보내고 공유 기록을 남김 */
+    /** 경보 중인 방(들)에 모두 확인을 보냄. 하나라도 보내지면 true */
     suspend fun ack(ctx: Context): Boolean = withContext(Dispatchers.IO) {
-        try {
-            val nodeId = Prefs(ctx).node
-            Db.put(ctx, "/cmd/$nodeId", "\"ACK\"")
-            ackUntil = System.currentTimeMillis() + 8_000L
-            silenced.value = true
-            val name = me.value?.name.orEmpty()
-            val body = JSONObject()
-                .put("msg", "보호자 확인 버튼 누름 (앱)" + if (name.isNotEmpty()) " · $name" else "")
-                .put("cls", "ok")
-                .put("by", if (name.isEmpty()) JSONObject.NULL else name)
-                .put("ts", JSONObject().put(".sv", "timestamp"))
-            runCatching { Db.post(ctx, "/logs/$nodeId", body.toString()) }
-            recompute()
-            true
-        } catch (e: Exception) {
-            false
+        val targets = rooms.value.values.filter { it.status == Status.EMERGENCY || it.status == Status.GRACE }.map { it.node }
+            .ifEmpty { listOf(live.value.node.ifEmpty { Prefs(ctx).node }) }
+        var any = false
+        for (nodeId in targets) {
+            try {
+                Db.put(ctx, "/cmd/$nodeId", "\"ACK\"")
+                synchronized(this@Store) { buf(nodeId).ackUntil = System.currentTimeMillis() + 8_000L }
+                any = true
+                val name = me.value?.name.orEmpty()
+                val body = JSONObject()
+                    .put("msg", "보호자 확인 버튼 누름 (앱)" + if (name.isNotEmpty()) " · $name" else "")
+                    .put("cls", "ok")
+                    .put("by", if (name.isEmpty()) JSONObject.NULL else name)
+                    .put("ts", JSONObject().put(".sv", "timestamp"))
+                runCatching { Db.post(ctx, "/logs/$nodeId", body.toString()) }
+            } catch (e: Exception) { }
         }
+        if (any) { silenced.value = true; recompute() }
+        any
     }
 }

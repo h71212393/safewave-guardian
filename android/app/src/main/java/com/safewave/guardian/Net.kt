@@ -66,14 +66,14 @@ object Http {
 
     fun call(
         method: String, url: String, body: String? = null, contentType: String = "application/json",
-        headers: Map<String, String> = emptyMap()
+        headers: Map<String, String> = emptyMap(), readTimeout: Int = 20_000
     ): Res {
         val c = URL(url).openConnection() as HttpURLConnection
         try {
             c.requestMethod = method
             headers.forEach { (k, v) -> c.setRequestProperty(k, v) }
             c.connectTimeout = 15_000
-            c.readTimeout = 20_000
+            c.readTimeout = readTimeout
             if (body != null) {
                 c.doOutput = true
                 c.setRequestProperty("Content-Type", "$contentType; charset=utf-8")

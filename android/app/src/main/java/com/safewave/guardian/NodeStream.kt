@@ -10,6 +10,7 @@ import java.net.URL
  */
 class NodeStream(
     private val ctx: Context,
+    private val nodeId: String,
     private val onEvent: (type: String, data: String) -> Unit,
     private val onStatus: (ok: Boolean, msg: String?) -> Unit
 ) {
@@ -20,7 +21,7 @@ class NodeStream(
     fun start() {
         if (running) return
         running = true
-        thread = Thread({ loop() }, "safewave-stream").apply { isDaemon = true; start() }
+        thread = Thread({ loop() }, "safewave-stream-$nodeId").apply { isDaemon = true; start() }
     }
 
     fun stop() {
@@ -42,7 +43,7 @@ class NodeStream(
         var backoff = 2_000L
         while (running) {
             try {
-                val url = Db.url(ctx, "/nodes/${Prefs(ctx).node}")
+                val url = Db.url(ctx, "/nodes/$nodeId")
                 val c = URL(url).openConnection() as HttpURLConnection
                 conn = c
                 c.setRequestProperty("Accept", "text/event-stream")

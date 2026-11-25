@@ -39,6 +39,7 @@ class AlarmActivity : ComponentActivity() {
             val live by Store.live.collectAsState()
             val test by Store.testAlarm.collectAsState()
             val profile by Store.profile.collectAsState()
+            val goer by Store.goer.collectAsState()
             val scope = rememberCoroutineScope()
             var busy by remember { mutableStateOf(false) }
 
@@ -58,7 +59,9 @@ class AlarmActivity : ComponentActivity() {
                         },
                         onSilence = { Store.silenced.value = true },
                         onCall = { dial(it.phone) },
-                        on119 = { dial("119") }
+                        on119 = { dial("119") },
+                        room = live.room, goer = goer,
+                        onGo = { scope.launch { Store.go(this@AlarmActivity) } }
                     )
                 }
             }

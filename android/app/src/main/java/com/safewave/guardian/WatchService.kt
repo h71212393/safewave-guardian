@@ -43,11 +43,14 @@ class WatchService : Service() {
         const val CH_ALARM = "alarm_v2"
         const val CH_GRACE = "grace"
         const val CH_NOTICE = "notice"
+        const val CH_SENSOR = "sensor"
         const val N_NOTICE = 3
+        const val N_SENSOR = 10   // + 방 번호
         const val N_WATCH = 1
         const val N_ALERT = 2
         const val ACTION_ACK = "com.safewave.guardian.ACK"
         const val ACTION_SILENCE = "com.safewave.guardian.SILENCE"
+        const val ACTION_GO = "com.safewave.guardian.GO"
 
         fun start(ctx: Context) {
             runCatching { ContextCompat.startForegroundService(ctx, Intent(ctx, WatchService::class.java)) }
@@ -71,6 +74,9 @@ class WatchService : Service() {
             nm.createNotificationChannel(NotificationChannel(CH_NOTICE, "공지사항", NotificationManager.IMPORTANCE_DEFAULT).apply {
                 description = "관리자가 새 공지사항을 올리면 알려 드립니다"
             })
+            nm.createNotificationChannel(NotificationChannel(CH_SENSOR, "센서 연결 끊김", NotificationManager.IMPORTANCE_DEFAULT).apply {
+                description = "거실·큰방 센서가 꺼지거나 와이파이가 끊기면 알려 드립니다"
+            })
             runCatching { nm.deleteNotificationChannel("alarm") }   // 예전 무음 채널 정리
             nm.createNotificationChannel(NotificationChannel(CH_ALARM, "긴급 낙상 경보", NotificationManager.IMPORTANCE_HIGH).apply {
                 description = "넘어지고 반응이 없을 때 울리는 경보입니다"
@@ -91,7 +97,9 @@ class WatchService : Service() {
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private var stream: NodeStream? = null
+    private var streams: List<NodeStream> = emptyList()
+    private val wasOnline = HashMap<String, Boolean>()
+    private var lastGoer: String? = null
     private var player: MediaPlayer? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
@@ -112,19 +120,39 @@ class WatchService : Service() {
             if (ttsReady) runCatching { tts?.language = Locale.KOREAN; tts?.setSpeechRate(0.9f) }
         }
 
-        stream = NodeStream(this, Store::onStreamEvent, Store::setConnection).also { it.start() }
+        // 거실·큰방 센서를 각각 실시간으로
+        streams = Rooms.list.map { (id, _) ->
+            NodeStream(this, id, { t, d -> Store.onStreamEvent(id, t, d) }, { ok, m -> Store.setConnection(id, ok, m) })
+                .also { it.start() }
+        }
 
         // 상태가 바뀔 때마다 알림·경보 처리
         scope.launch {
             combine(Store.live, Store.testAlarm, Store.silenced) { l, t, s -> Triple(l, t, s) }
                 .collect { (l, t, s) -> onState(l, t, s) }
         }
+        // 방마다 센서 연결이 끊기면 알림
+        scope.launch { Store.rooms.collect { onRooms(it) } }
+        // 경보 중이면 3초마다 "내가 갈게요" 누른 보호자 확인
+        scope.launch {
+            while (isActive) {
+                val l = Store.live.value
+                if (l.status == Status.EMERGENCY || l.status == Status.GRACE) Store.checkGo(this@WatchService)
+                val g = Store.goer.value
+                if (g != lastGoer) {
+                    lastGoer = g
+                    if (g != null && g != "나") speak("$g 님이 가고 계세요.")
+                    if (Store.live.value.alarming) getSystemService(NotificationManager::class.java).notify(N_ALERT, alarmNotification(false, quiet = true))
+                }
+                delay(3_000)
+            }
+        }
         // 2초마다 연결 끊김 여부 다시 계산
         scope.launch { while (isActive) { Store.recompute(); delay(2_000) } }
         // 대상자 정보는 5분마다
         scope.launch { while (isActive) { Store.refreshShared(this@WatchService); checkNotice(); delay(5 * 60_000L) } }
         // 50분마다 새 토큰으로 다시 연결 (토큰은 1시간짜리)
-        scope.launch { while (isActive) { delay(50 * 60_000L); stream?.reconnect() } }
+        scope.launch { while (isActive) { delay(50 * 60_000L); streams.forEach { it.reconnect() } } }
         // 1분마다 권한 확인 (관리자가 이용 중지하면 멈춤)
         scope.launch {
             while (isActive) {
@@ -141,13 +169,14 @@ class WatchService : Service() {
                 if (Store.testAlarm.value) Store.testAlarm.value = false else Store.ack(this@WatchService)
             }
             ACTION_SILENCE -> Store.silenced.value = true
+            ACTION_GO -> scope.launch { if (!Store.testAlarm.value) Store.go(this@WatchService) else Store.silenced.value = true }
         }
         return START_STICKY
     }
 
     override fun onDestroy() {
         scope.cancel()
-        stream?.stop()
+        streams.forEach { it.stop() }
         stopAlarm()
         runCatching { tts?.shutdown() }
         getSystemService(NotificationManager::class.java).cancel(N_ALERT)
@@ -156,6 +185,31 @@ class WatchService : Service() {
 
     // ---------------- 상태 처리 ----------------
     private fun name() = Store.profile.value.displayName
+    /** "큰방에서 " 처럼 장소 (방 이름을 모르면 빈 글자) */
+    private fun where() = Store.live.value.room.let { if (it.isEmpty()) "" else "${it}에서 " }
+
+    /** 방마다 센서가 살아 있다가 끊기면 알림, 다시 붙으면 알림 지움 */
+    private fun onRooms(map: Map<String, Live>) {
+        val nm = getSystemService(NotificationManager::class.java)
+        Rooms.list.forEachIndexed { i, (id, room) ->
+            val l = map[id] ?: return@forEachIndexed
+            val on = l.status != Status.OFFLINE && l.status != Status.LOADING
+            if (on) {
+                if (wasOnline[id] == false) nm.cancel(N_SENSOR + i)
+                wasOnline[id] = true
+            } else if (l.status == Status.OFFLINE && wasOnline[id] == true) {
+                wasOnline[id] = false
+                nm.notify(N_SENSOR + i, NotificationCompat.Builder(this, CH_SENSOR)
+                    .setSmallIcon(R.drawable.ic_notify)
+                    .setContentTitle("$room 센서와 연결이 끊겼어요")
+                    .setContentText("센서 전원(배터리)과 와이파이를 확인해 주세요. 끊긴 동안은 낙상을 알 수 없어요.")
+                    .setStyle(NotificationCompat.BigTextStyle().bigText("센서 전원(배터리)과 와이파이를 확인해 주세요. 끊긴 동안은 낙상을 알 수 없어요."))
+                    .setContentIntent(openApp())
+                    .setAutoCancel(true)
+                    .build())
+            }
+        }
+    }
 
     private fun onState(l: Live, test: Boolean, silenced: Boolean) {
         val nm = getSystemService(NotificationManager::class.java)
@@ -174,8 +228,8 @@ class WatchService : Service() {
                     Store.silenced.value = false
                     nm.notify(N_ALERT, alarmNotification(test))
                     val words = if (test) "시험 경보입니다. 실제 상황이 아닙니다."
-                                else if (Store.profile.value.people.isNotEmpty()) "긴급 상황입니다. ${name()} 님 댁에서 낙상이 감지되었습니다. 확인해 주세요."
-                                else "긴급 상황입니다. ${name()} 님이 넘어지셨습니다. 확인해 주세요."
+                                else if (Store.profile.value.people.isNotEmpty()) "긴급 상황입니다. ${name()} 님 댁 ${where()}낙상이 감지되었습니다. 확인해 주세요."
+                                else "긴급 상황입니다. ${name()} 님이 ${where()}넘어지셨습니다. 확인해 주세요."
                     speak(words)
                     startAlarm(if (Prefs(this).voice) 6_000L else 3_000L)
                     openOnCoverIfFolded()
@@ -184,8 +238,8 @@ class WatchService : Service() {
                 "grace" -> {
                     stopAlarm()
                     nm.notify(N_ALERT, graceNotification(l))
-                    speak(if (Store.profile.value.people.isNotEmpty()) "${name()} 님 댁에서 낙상이 의심됩니다. 지금 확인하고 있습니다."
-                          else "${name()} 님이 넘어지신 것 같습니다. 지금 확인하고 있습니다.")
+                    speak(if (Store.profile.value.people.isNotEmpty()) "${name()} 님 댁 ${where()}낙상이 의심됩니다. 지금 확인하고 있습니다."
+                          else "${name()} 님이 ${where()}넘어지신 것 같습니다. 지금 확인하고 있습니다.")
                 }
                 else -> {
                     stopAlarm()
@@ -233,9 +287,9 @@ class WatchService : Service() {
 
     private fun watchText(l: Live): String = when {
         l.status == Status.EMERGENCY && l.acking -> "확인을 보냈어요 · 센서 응답 기다리는 중"
-        l.status == Status.EMERGENCY -> "긴급! ${name()} 님이 넘어지셨어요"
-        l.status == Status.GRACE -> "넘어진 것 같아요 · 확인 중"
-        l.status == Status.NORMAL -> "${name()} 님 · 안전해요"
+        l.status == Status.EMERGENCY -> "긴급! ${name()} 님이 ${where()}넘어지셨어요"
+        l.status == Status.GRACE -> "${l.room.ifEmpty { "집" }} · 넘어진 것 같아요 · 확인 중"
+        l.status == Status.NORMAL -> "${name()} 님 · 안전해요" + (if (l.room.isNotEmpty()) " (${l.room})" else "")
         l.status == Status.EMPTY -> "${name()} 님 · 집에 안 계세요"
         l.status == Status.OFFLINE -> "센서와 연결이 끊겼어요"
         else -> "센서와 연결하는 중이에요"
@@ -270,7 +324,7 @@ class WatchService : Service() {
             .setContentIntent(openApp())
             .build()
 
-    private fun alarmNotification(test: Boolean): Notification {
+    private fun alarmNotification(test: Boolean, quiet: Boolean = false): Notification {
         val full = PendingIntent.getActivity(
             this, 1, Intent(this, AlarmActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT, Cover.launchOptions(this)
@@ -283,23 +337,27 @@ class WatchService : Service() {
             this, 3, Intent(this, WatchService::class.java).setAction(ACTION_SILENCE),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        return NotificationCompat.Builder(this, CH_ALARM)
+        val go = PendingIntent.getService(
+            this, 5, Intent(this, WatchService::class.java).setAction(ACTION_GO),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val b = NotificationCompat.Builder(this, CH_ALARM)
             .setSmallIcon(R.drawable.ic_notify)
             .setColor(Color.parseColor("#B91C1C"))
             .setContentTitle(if (test) "시험 경보 (실제 상황 아님)"
-                else if (Store.profile.value.people.isNotEmpty()) "긴급! ${name()} 님 댁 낙상 감지" else "긴급! ${name()} 님이 넘어지셨어요")
-            .setContentText("눌러서 확인해 주세요")
+                else if (Store.profile.value.people.isNotEmpty()) "긴급! ${name()} 님 댁 ${where()}낙상 감지" else "긴급! ${name()} 님이 ${where()}넘어지셨어요")
+            .setContentText(Store.goer.value?.let { if (it == "나") "내가 간다고 알렸어요" else "$it 님이 가고 계세요" } ?: "눌러서 확인해 주세요")
             .setCategory(NotificationCompat.CATEGORY_ALARM)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setAutoCancel(false)
-            .setOnlyAlertOnce(false)
+            .setOnlyAlertOnce(quiet)
             .setDefaults(NotificationCompat.DEFAULT_ALL)
             .setFullScreenIntent(full, true)
             .setContentIntent(full)
             .addAction(0, "확인했어요", ack)
-            .addAction(0, "소리 끄기", mute)
-            .build()
+        if (Store.goer.value == null && !test) b.addAction(0, "내가 갈게요", go)
+        return b.addAction(0, "소리 끄기", mute).build()
     }
 
     // ---------------- 소리·진동·음성 ----------------

@@ -15,6 +15,13 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.material.icons.filled.Face
+import com.safewave.guardian.ui.AiScreen
+import com.safewave.guardian.ui.RoomCards
+import com.safewave.guardian.ui.SegTabs
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -72,8 +79,13 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-const val TAB_NOTICE = 3
-const val TAB_SITE = 5     // 관제 사이트 (앱 안에서 웹 화면으로)
+// 아래 메뉴: 관제 · 알림 · 전화 · AI · 설정
+const val TAB_CTRL = 0     // 거실·큰방 상태 + 요약 / 관제 사이트
+const val TAB_ALERT = 1    // 기록 + 공지
+const val TAB_CALL = 2
+const val TAB_AI = 3
+const val TAB_SET = 4
+const val TAB_NOTICE = 101 // 알림 탭의 "공지" 로 바로 (새 공지 알림을 눌렀을 때)
 
 fun Context.dial(number: String) {
     val n = number.filter { it.isDigit() || it == '+' }
@@ -250,7 +262,18 @@ class MainActivity : ComponentActivity() {
         var noticeRead by remember { mutableStateOf(Prefs(ctx).noticeRead) }
         val newest = notices.maxByOrNull { it.ts }
         val unread = newest != null && newest.ts > noticeRead
-        LaunchedEffect(openTab.intValue) { if (openTab.intValue >= 0) { info = false; tab = openTab.intValue; openTab.intValue = -1 } }
+        val rooms by Store.rooms.collectAsState()
+        val goer by Store.goer.collectAsState()
+        var alertSub by remember { mutableIntStateOf(0) }     // 알림 탭: 0 기록, 1 공지
+        var siteMode by remember { mutableStateOf(false) }    // 관제 탭: false 요약, true 관제 사이트
+        LaunchedEffect(openTab.intValue) {
+            val o = openTab.intValue
+            if (o >= 0) {
+                info = false
+                if (o == TAB_NOTICE) { tab = TAB_ALERT; alertSub = 1 } else tab = o
+                openTab.intValue = -1
+            }
+        }
 
         // 화면이 켜져 있는 동안 기록은 15초마다
         LaunchedEffect(Unit) { while (true) { Store.refreshRecords(ctx); delay(15_000) } }
@@ -267,6 +290,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         val first = profile.contacts.firstOrNull { it.phone.isNotBlank() }
+        val go: () -> Unit = { scope.launch { Store.go(ctx) } }
 
         // 긴급이거나 시험 경보면 화면 전체를 경보로
         if (live.alarming || test) {
@@ -274,20 +298,28 @@ class MainActivity : ComponentActivity() {
                 profile.displayName, test && !live.alarming, ackBusy, first,
                 onAck = { if (test && !live.alarming) Store.testAlarm.value = false else ack() },
                 onSilence = { Store.silenced.value = true },
-                onCall = { ctx.dial(it.phone) }, on119 = { ctx.dial("119") }
+                onCall = { ctx.dial(it.phone) }, on119 = { ctx.dial("119") },
+                room = live.room, goer = goer, onGo = go
             )
             return
         }
 
         // 관제 사이트 화면은 한 번 만들어 두고 계속 씀 (탭을 오갈 때마다 새로 불러오지 않게)
-        // (처음 "관제" 탭을 열 때 만듦 → 안 쓰면 데이터·배터리를 쓰지 않음)
+        // (처음 "사이트" 를 열 때 만듦 → 안 쓰면 데이터·배터리를 쓰지 않음)
         var web by remember { mutableStateOf<android.webkit.WebView?>(null) }
-        if (tab == TAB_SITE && web == null) web = Site.create(ctx)
-        BackHandler(enabled = info || tab != 0) {
+        if (tab == TAB_CTRL && siteMode && web == null) web = Site.create(ctx)
+        BackHandler(enabled = info || tab != TAB_CTRL || siteMode) {
             val w = web
             if (info) info = false
-            else if (tab == TAB_SITE && w != null && w.canGoBack()) w.goBack()
-            else tab = 0
+            else if (tab == TAB_CTRL && siteMode && w != null && w.canGoBack()) w.goBack()
+            else if (tab == TAB_CTRL && siteMode) siteMode = false
+            else tab = TAB_CTRL
+        }
+        /** 방 카드를 누르면 그 방의 관제 사이트 화면으로 */
+        val openRoom: (String) -> Unit = { id ->
+            siteMode = true
+            val w = web ?: Site.create(ctx).also { web = it }
+            w.loadUrl(Site.URL + "?node=" + id)
         }
 
         Column(Modifier.fillMaxSize()) {
@@ -296,21 +328,39 @@ class MainActivity : ComponentActivity() {
                     onSave = { np, done -> scope.launch { done(Store.saveProfile(ctx, np, "대상자 정보")) } },
                     onSavePeople = { list, what, done -> scope.launch { done(Store.savePeople(ctx, list, what)) } })
                 else when (tab) {
-                    0 -> HomeScreen(live, profile, recs, ackBusy, ackMsg, ack,
-                        onCall = { ctx.dial(it.phone) }, on119 = { ctx.dial("119") },
-                        onInfo = { info = true }, onRecords = { tab = 2 },
-                        newNotice = if (unread) newest else null, onNotice = { tab = TAB_NOTICE })
-                    1 -> CallScreen(profile, me?.canEdit == true, onCall = { ctx.dial(it.phone) }, on119 = { ctx.dial("119") },
+                    TAB_CTRL -> Column(Modifier.fillMaxSize()) {
+                        Column(Modifier.background(C.bg).padding(start = 18.dp, end = 18.dp, top = 12.dp, bottom = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            RoomCards(rooms, openRoom)
+                            SegTabs(listOf("요약", "관제 사이트"), if (siteMode) 1 else 0, { siteMode = it == 1 })
+                        }
+                        Box(Modifier.weight(1f)) {
+                            if (siteMode) web?.let { SiteScreen(it) }
+                            else HomeScreen(live, profile, recs, ackBusy, ackMsg, ack,
+                                onCall = { ctx.dial(it.phone) }, on119 = { ctx.dial("119") },
+                                onInfo = { info = true }, onRecords = { tab = TAB_ALERT; alertSub = 0 },
+                                newNotice = if (unread) newest else null, onNotice = { tab = TAB_ALERT; alertSub = 1 },
+                                goer = goer, onGo = go)
+                        }
+                    }
+                    TAB_ALERT -> Column(Modifier.fillMaxSize()) {
+                        Box(Modifier.background(C.bg).padding(start = 18.dp, end = 18.dp, top = 12.dp)) {
+                            SegTabs(listOf("기록", "공지"), alertSub, { alertSub = it }, dot = if (unread) 1 else -1)
+                        }
+                        Box(Modifier.weight(1f)) {
+                            if (alertSub == 0) RecordsScreen(recs) { scope.launch { Store.refreshRecords(ctx) } }
+                            else NoticeScreen(
+                                notices, me?.canEdit == true, noticeRead,
+                                onRead = { noticeRead = it; Prefs(ctx).noticeRead = it },
+                                onRefresh = { scope.launch { Store.refreshShared(ctx) } },
+                                onSave = { old, t, b, pin, done -> scope.launch { done(Store.saveNotice(ctx, old, t, b, pin)) } },
+                                onDelete = { n, done -> scope.launch { done(Store.deleteNotice(ctx, n)) } }
+                            )
+                        }
+                    }
+                    TAB_CALL -> CallScreen(profile, me?.canEdit == true, onCall = { ctx.dial(it.phone) }, on119 = { ctx.dial("119") },
                         onSave = { list, done -> scope.launch { done(Store.saveProfile(ctx, profile.copy(contacts = list), "비상연락처")) } })
-                    2 -> RecordsScreen(recs) { scope.launch { Store.refreshRecords(ctx) } }
-                    TAB_NOTICE -> NoticeScreen(
-                        notices, me?.canEdit == true, noticeRead,
-                        onRead = { noticeRead = it; Prefs(ctx).noticeRead = it },
-                        onRefresh = { scope.launch { Store.refreshShared(ctx) } },
-                        onSave = { old, t, b, pin, done -> scope.launch { done(Store.saveNotice(ctx, old, t, b, pin)) } },
-                        onDelete = { n, done -> scope.launch { done(Store.deleteNotice(ctx, n)) } }
-                    )
-                    TAB_SITE -> web?.let { SiteScreen(it) }
+                    TAB_AI -> AiScreen()
                     else -> SettingsScreen(
                         me, font, voice, sound, Prefs(ctx).node,
                         flipGuide, { flipGuide = it; Prefs(ctx).flipGuide = it },
@@ -325,19 +375,26 @@ class MainActivity : ComponentActivity() {
                 }
             }
             NavigationBar(containerColor = Color.White, tonalElevation = 0.dp) {
-                val items = listOf("홈" to Icons.Default.Home, "전화" to Icons.Default.Phone,
-                    "기록" to Icons.Default.List, "공지" to Icons.Default.Notifications, "설정" to Icons.Default.Settings,
-                    "관제" to Icons.Default.Info)   // 5 = TAB_SITE: 관제 사이트
+                val items = listOf("관제" to Icons.Default.Home, "알림" to Icons.Default.Notifications,
+                    "전화" to Icons.Default.Phone, "AI" to Icons.Default.Face, "설정" to Icons.Default.Settings)
+                val alertDot = unread || live.status == Status.OFFLINE
                 items.forEachIndexed { i, (label, icon) ->
                     NavigationBarItem(
                         selected = tab == i && !info,
                         onClick = { info = false; tab = i },
                         icon = {
-                            if (i == TAB_NOTICE && unread) BadgedBox(badge = { Badge(containerColor = C.crit) }) {
-                                Icon(icon, contentDescription = "$label (새 글)", modifier = Modifier.size(32.dp))
-                            } else Icon(icon, contentDescription = label, modifier = Modifier.size(32.dp))
+                            when {
+                                // 가운데 전화는 급할 때 바로 누르게 빨간 동그라미
+                                i == TAB_CALL -> Box(Modifier.size(52.dp).clip(CircleShape).background(C.crit), contentAlignment = Alignment.Center) {
+                                    Icon(icon, contentDescription = label, tint = Color.White, modifier = Modifier.size(32.dp))
+                                }
+                                i == TAB_ALERT && alertDot -> BadgedBox(badge = { Badge(containerColor = C.crit) }) {
+                                    Icon(icon, contentDescription = "$label (새 소식)", modifier = Modifier.size(32.dp))
+                                }
+                                else -> Icon(icon, contentDescription = label, modifier = Modifier.size(32.dp))
+                            }
                         },
-                        label = { Text(label, fontSize = 15.sp, fontWeight = FontWeight.Bold, maxLines = 1) },   // 메뉴가 6개라 조금 작게
+                        label = { Text(label, fontSize = 17.sp, fontWeight = FontWeight.Bold, maxLines = 1) },
                         colors = NavigationBarItemDefaults.colors(
                             selectedIconColor = C.brand, selectedTextColor = C.brand,
                             unselectedIconColor = C.sub, unselectedTextColor = C.sub,
