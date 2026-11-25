@@ -1,0 +1,65 @@
+name: SafeWave 보호자 앱 APK 만들기
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: APK 빌드
+        working-directory: android
+        run: |
+          set -o pipefail
+          gradle assembleRelease --no-daemon --stacktrace 2>&1 | tee ../build.log
+
+      - name: 파일 이름 정리
+        run: cp android/app/build/outputs/apk/release/app-release.apk SafeWave-Guardian.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SafeWave-Guardian
+          path: SafeWave-Guardian.apk
+
+      - name: 최신 APK 공개 링크로 올리기
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-latest
+          target_commitish: ${{ github.sha }}
+          name: SafeWave 보호자 앱 (최신 APK)
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
+          files: SafeWave-Guardian.apk
+          body: |
+            휴대폰에서 아래 SafeWave-Guardian.apk 를 눌러 받은 뒤 설치하세요.
+            (처음 설치할 때 "출처를 알 수 없는 앱 설치"를 허용해야 합니다)
+            빌드: ${{ github.sha }}
+
+      - name: 실패하면 오류 기록 올리기
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-log
+          target_commitish: ${{ github.sha }}
+          name: 앱 빌드 오류 기록
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
+          files: build.log
