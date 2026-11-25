@@ -222,7 +222,7 @@ fun HomeScreen(
     l: Live, p: Profile, recs: List<Rec>, ackBusy: Boolean, ackMsg: String,
     onAck: () -> Unit, onCall: (Contact) -> Unit, on119: () -> Unit, onInfo: () -> Unit, onRecords: () -> Unit,
     newNotice: com.safewave.guardian.Notice? = null, onNotice: () -> Unit = {},
-    goer: String? = null, onGo: (() -> Unit)? = null
+    goer: String? = null, onGo: (() -> Unit)? = null, onSite: (() -> Unit)? = null
 ) {
     Page {
         if (newNotice != null) NewNoticeBanner(newNotice, onNotice)
@@ -238,6 +238,11 @@ fun HomeScreen(
             if (recs.isEmpty()) Body("아직 기록이 없어요.")
             recs.take(3).forEach { RecordRow(it) }
             if (recs.size > 3) TextButton(onRecords) { Text("기록 더 보기", fontSize = 20.sp, fontWeight = FontWeight.Bold) }
+        }
+        if (onSite != null) Card {
+            Text("관제 사이트", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = C.ink)
+            Body("사이트의 모든 기능(3D 지도, 장치 설정, 예외 구역 등)을 앱 안에서 그대로 볼 수 있어요.", size = 18)
+            BigButton("관제 사이트 열기", onSite, outlined = true, contentColor = C.brand, icon = Icons.Default.Home)
         }
     }
 }

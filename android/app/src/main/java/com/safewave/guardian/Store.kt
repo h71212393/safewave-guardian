@@ -20,7 +20,10 @@ data class Live(
     val acking: Boolean = false,     // 확인 버튼을 눌러서 센서가 정상으로 바뀌기를 기다리는 중
     val connMsg: String = "",
     val node: String = "",           // 어느 센서 (daegu-102-1 …)
-    val room: String = ""            // 방 이름 (거실·큰방)
+    val room: String = "",           // 방 이름 (거실·큰방)
+    val px: Float? = null,           // 레이더가 잡은 사람 위치 (m, 레이더 기준 좌우·앞뒤). 최근 2초 안에 잡혔을 때만
+    val py: Float? = null,
+    val ph: Float? = null            // 바닥에서 높이 (m)
 ) {
     /** 경보를 울려야 하는 상태 (확인을 보낸 직후는 제외) */
     val alarming get() = status == Status.EMERGENCY && !acking
@@ -59,6 +62,16 @@ data class Notice(val id: String, val title: String, val body: String, val by: S
 /** kind: ok(초록) wn(주황) cr(빨강) sys(회색) */
 data class Rec(val id: String, val ts: Long, val msg: String, val kind: String)
 
+/** 예외 구역 (지도 위 m 단위, 방 5m×5m 기준 — 관제 사이트와 같음) */
+data class Zone(val x: Float, val y: Float, val w: Float, val h: Float, val name: String)
+
+/** 방 지도를 그리는 설정 (관제 사이트의 가운데 맞추기·뒤집기·예외 구역을 그대로 씀) */
+data class RoomView(
+    val offX: Float = 0f, val offY: Float = 0f,
+    val flipX: Boolean = false, val flipY: Boolean = false, val swap: Boolean = false,
+    val zones: List<Zone> = emptyList()
+)
+
 /** 집에 있는 레이더 센서 (관제 사이트와 같은 이름) */
 object Rooms {
     val list = listOf("daegu-102-1" to "거실", "daegu-102-2" to "큰방")
@@ -78,6 +91,7 @@ object Store {
     val notices = MutableStateFlow<List<Notice>>(emptyList())
     /** 방별 상태 (거실·큰방). live 는 이 중 가장 급한 상태 */
     val rooms = MutableStateFlow<Map<String, Live>>(emptyMap())
+    val views = MutableStateFlow<Map<String, RoomView>>(emptyMap())
     /** 이번 경보에서 "내가 갈게요" 를 누른 보호자 이름 ("나" 면 이 휴대폰) */
     val goer = MutableStateFlow<String?>(null)
     /** AI 탭 (탭을 오가도 남아 있게 여기 둠) */
@@ -159,7 +173,10 @@ object Store {
         }
         if (b.ackUntil > 0 && (status == Status.NORMAL || status == Status.EMPTY || now > b.ackUntil)) b.ackUntil = 0L
         val gl = n.opt("graceLeft")
+        fun f(k: String): Float? = (n.opt(k) as? Number)?.toFloat()?.takeIf { it.isFinite() }
+        val hasPos = online && f("px") != null && f("py") != null
         return Live(
+            px = if (hasPos) f("px") else null, py = if (hasPos) f("py") else null, ph = if (online) f("ph") else null,
             status = status,
             graceLeft = (gl as? Number)?.toInt() ?: gl?.toString()?.toDoubleOrNull()?.toInt(),
             msg = n.optString("msg", ""),
@@ -287,15 +304,46 @@ object Store {
 
     // ---------------- 대상자 정보 (사이트의 shared/<노드>/profile) ----------------
     suspend fun refreshShared(ctx: Context) = withContext(Dispatchers.IO) {
+        val mainId = Prefs(ctx).node
+        val vm = HashMap(views.value)
         runCatching {
-            val body = Db.get(ctx, "/shared/${Prefs(ctx).node}")
+            val body = Db.get(ctx, "/shared/$mainId")
             if (body.trim() == "null") return@runCatching
             val doc = JSONObject(body)
             notices.value = parseNotices(doc.optJSONObject("notices"))
             val people = parsePeople(doc.opt("people"))
             val pj = doc.optJSONObject("profile")
             profile.value = (if (pj != null) parseProfile(pj) else profile.value).copy(people = people)
+            vm[mainId] = parseView(doc)
         }
+        // 다른 방은 지도 설정만
+        for ((id, _) in Rooms.list) if (id != mainId) runCatching {
+            val body = Db.get(ctx, "/shared/$id")
+            vm[id] = if (body.trim() == "null") RoomView() else parseView(JSONObject(body))
+        }
+        views.value = vm
+    }
+
+    private fun parseView(doc: JSONObject): RoomView {
+        val off = doc.optJSONArray("posOff")
+        val zs = mutableListOf<Zone>()
+        val za = doc.opt("zones")
+        val list = when (za) {
+            is JSONArray -> (0 until za.length()).mapNotNull { za.optJSONObject(it) }
+            is JSONObject -> za.keys().asSequence().mapNotNull { za.optJSONObject(it) }.toList()
+            else -> emptyList()
+        }
+        list.forEach { z ->
+            val w = z.optDouble("w", Double.NaN); val h = z.optDouble("h", Double.NaN)
+            val x = z.optDouble("x", Double.NaN); val y = z.optDouble("y", Double.NaN)
+            if (!x.isNaN() && !y.isNaN() && !w.isNaN() && !h.isNaN())
+                zs += Zone(x.toFloat(), y.toFloat(), w.toFloat(), h.toFloat(), z.optString("name", "구역"))
+        }
+        return RoomView(
+            offX = off?.optDouble(0, 0.0)?.toFloat() ?: 0f, offY = off?.optDouble(1, 0.0)?.toFloat() ?: 0f,
+            flipX = doc.optBoolean("flipX", false), flipY = doc.optBoolean("flipY", false), swap = doc.optBoolean("swapXY", false),
+            zones = zs
+        )
     }
 
     private fun parseNotices(j: JSONObject?): List<Notice> {

@@ -20,6 +20,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.draw.clip
 import androidx.compose.material.icons.filled.Face
 import com.safewave.guardian.ui.AiScreen
+import com.safewave.guardian.ui.RadarScreen
+import androidx.compose.material3.TextButton
 import com.safewave.guardian.ui.RoomCards
 import com.safewave.guardian.ui.SegTabs
 import androidx.compose.foundation.layout.Box
@@ -265,7 +267,9 @@ class MainActivity : ComponentActivity() {
         val rooms by Store.rooms.collectAsState()
         val goer by Store.goer.collectAsState()
         var alertSub by remember { mutableIntStateOf(0) }     // 알림 탭: 0 기록, 1 공지
-        var siteMode by remember { mutableStateOf(false) }    // 관제 탭: false 요약, true 관제 사이트
+        var radarMode by remember { mutableStateOf(false) }   // 관제 탭: false 요약, true 실시간 레이더
+        var siteMode by remember { mutableStateOf(false) }    // 관제 사이트를 화면 가득 연 상태
+        val views by Store.views.collectAsState()
         LaunchedEffect(openTab.intValue) {
             val o = openTab.intValue
             if (o >= 0) {
@@ -308,19 +312,16 @@ class MainActivity : ComponentActivity() {
         // (처음 "사이트" 를 열 때 만듦 → 안 쓰면 데이터·배터리를 쓰지 않음)
         var web by remember { mutableStateOf<android.webkit.WebView?>(null) }
         if (tab == TAB_CTRL && siteMode && web == null) web = Site.create(ctx)
-        BackHandler(enabled = info || tab != TAB_CTRL || siteMode) {
+        BackHandler(enabled = info || tab != TAB_CTRL || siteMode || radarMode) {
             val w = web
             if (info) info = false
             else if (tab == TAB_CTRL && siteMode && w != null && w.canGoBack()) w.goBack()
             else if (tab == TAB_CTRL && siteMode) siteMode = false
+            else if (tab == TAB_CTRL && radarMode) radarMode = false
             else tab = TAB_CTRL
         }
-        /** 방 카드를 누르면 그 방의 관제 사이트 화면으로 */
-        val openRoom: (String) -> Unit = { id ->
-            siteMode = true
-            val w = web ?: Site.create(ctx).also { web = it }
-            w.loadUrl(Site.URL + "?node=" + id)
-        }
+        /** 방 카드를 누르면 실시간 레이더 화면으로 */
+        val openRoom: (String) -> Unit = { radarMode = true }
 
         Column(Modifier.fillMaxSize()) {
             Box(Modifier.weight(1f)) {
@@ -328,19 +329,25 @@ class MainActivity : ComponentActivity() {
                     onSave = { np, done -> scope.launch { done(Store.saveProfile(ctx, np, "대상자 정보")) } },
                     onSavePeople = { list, what, done -> scope.launch { done(Store.savePeople(ctx, list, what)) } })
                 else when (tab) {
-                    TAB_CTRL -> Column(Modifier.fillMaxSize()) {
+                    TAB_CTRL -> if (siteMode) Column(Modifier.fillMaxSize()) {
+                        // 관제 사이트를 화면 가득 (위에 돌아가기)
+                        TextButton({ siteMode = false }, Modifier.padding(start = 6.dp)) {
+                            Text("← 요약으로 돌아가기", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = C.brand)
+                        }
+                        Box(Modifier.weight(1f)) { web?.let { SiteScreen(it) } }
+                    } else Column(Modifier.fillMaxSize()) {
                         Column(Modifier.background(C.bg).padding(start = 18.dp, end = 18.dp, top = 12.dp, bottom = 8.dp),
                             verticalArrangement = Arrangement.spacedBy(10.dp)) {
                             RoomCards(rooms, openRoom)
-                            SegTabs(listOf("요약", "관제 사이트"), if (siteMode) 1 else 0, { siteMode = it == 1 })
+                            SegTabs(listOf("요약", "실시간 레이더"), if (radarMode) 1 else 0, { radarMode = it == 1 })
                         }
                         Box(Modifier.weight(1f)) {
-                            if (siteMode) web?.let { SiteScreen(it) }
+                            if (radarMode) RadarScreen(rooms, views)
                             else HomeScreen(live, profile, recs, ackBusy, ackMsg, ack,
                                 onCall = { ctx.dial(it.phone) }, on119 = { ctx.dial("119") },
                                 onInfo = { info = true }, onRecords = { tab = TAB_ALERT; alertSub = 0 },
                                 newNotice = if (unread) newest else null, onNotice = { tab = TAB_ALERT; alertSub = 1 },
-                                goer = goer, onGo = go)
+                                goer = goer, onGo = go, onSite = { siteMode = true })
                         }
                     }
                     TAB_ALERT -> Column(Modifier.fillMaxSize()) {

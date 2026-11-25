@@ -1,5 +1,25 @@
 package com.safewave.guardian.ui
 
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.rememberTextMeasurer
+import com.safewave.guardian.RoomView
+import kotlinx.coroutines.delay
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -93,7 +113,119 @@ fun RoomCards(rooms: Map<String, Live>, onOpen: (String) -> Unit) {
     }
 }
 
-// ---------------- 위쪽 작은 탭 (요약/사이트, 기록/공지) ----------------
+// ---------------- 실시간 레이더 ----------------
+private const val ROOM_M = 5f   // 관제 사이트와 같은 5m × 5m 지도, 레이더는 가운데
+
+/** 레이더 값(m) → 지도 위 위치(m). 관제 사이트의 가운데 맞추기·뒤집기 설정을 그대로 씀 */
+private fun toMap(l: Live, v: RoomView): Offset? {
+    val px = l.px ?: return null
+    val py = l.py ?: return null
+    var ax = (px - v.offX) * (if (v.flipX) -1f else 1f)
+    var ay = (py - v.offY) * (if (v.flipY) 1f else -1f)   // 레이더 앞쪽이 지도 위쪽
+    if (v.swap) { val t = ax; ax = ay; ay = t }
+    return Offset((ROOM_M / 2 + ax).coerceIn(0.15f, ROOM_M - 0.15f), (ROOM_M / 2 + ay).coerceIn(0.15f, ROOM_M - 0.15f))
+}
+
+@Composable
+fun RadarScreen(rooms: Map<String, Live>, views: Map<String, RoomView>) {
+    Page {
+        Title("실시간 레이더")
+        Body("점이 사람이 있는 곳이에요. 가운데 파란 점이 레이더, 위쪽이 레이더 앞쪽이에요. 초록 칸은 예외 구역이에요.", size = 17)
+        Rooms.list.forEach { (id, room) ->
+            val l = rooms[id] ?: Live(room = room)
+            val k = look(l, "")
+            Card {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(room, fontSize = 26.sp, fontWeight = FontWeight.ExtraBold, color = C.ink, modifier = Modifier.weight(1f))
+                    Text(shortWord(l), fontSize = 19.sp, fontWeight = FontWeight.Bold, color = Color.White,
+                        modifier = Modifier.clip(RoundedCornerShape(12.dp)).background(k.color).padding(horizontal = 12.dp, vertical = 6.dp))
+                }
+                RadarMap(l, views[id] ?: RoomView(), k.color)
+            }
+        }
+    }
+}
+
+@OptIn(androidx.compose.ui.text.ExperimentalTextApi::class)
+@Composable
+private fun RadarMap(l: Live, v: RoomView, dotColor: Color) {
+    val now = toMap(l, v)
+    // 사람을 놓치면 마지막 위치를 4초 동안 흐리게 보여 줌
+    var last by remember { mutableStateOf<Offset?>(null) }
+    var lastAt by remember { mutableLongStateOf(0L) }
+    val trail = remember { mutableStateListOf<Offset>() }
+    LaunchedEffect(now) {
+        if (now != null) {
+            last = now; lastAt = System.currentTimeMillis()
+            trail.add(now); while (trail.size > 14) trail.removeAt(0)
+        }
+    }
+    var tick by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) { while (true) { delay(1000); tick = System.currentTimeMillis() } }
+    val target = now ?: last
+    val fresh = now != null
+    val stale = !fresh && target != null && tick - lastAt < 4000
+    LaunchedEffect(fresh, stale) { if (!fresh && !stale) trail.clear() }
+
+    val ax by animateFloatAsState(target?.x ?: ROOM_M / 2, tween(500, easing = LinearEasing), label = "x")
+    val ay by animateFloatAsState(target?.y ?: ROOM_M / 2, tween(500, easing = LinearEasing), label = "y")
+    val pulse by rememberInfiniteTransition(label = "p").animateFloat(
+        0f, 1f, infiniteRepeatable(tween(1600, easing = LinearEasing), RepeatMode.Restart), label = "pulse")
+    val tm = rememberTextMeasurer()
+    val offline = l.status == Status.OFFLINE || l.status == Status.LOADING
+
+    Canvas(Modifier.fillMaxWidth().aspectRatio(1f).clip(RoundedCornerShape(18.dp)).background(Color(0xFF0F172A))) {
+        val k = size.width / ROOM_M
+        val grid = Color.White.copy(alpha = 0.08f)
+        for (i in 1 until ROOM_M.toInt()) {
+            drawLine(grid, Offset(i * k, 0f), Offset(i * k, size.height), 1.dp.toPx())
+            drawLine(grid, Offset(0f, i * k), Offset(size.width, i * k), 1.dp.toPx())
+        }
+        // 레이더 거리 (1m, 2m)
+        for (r in 1..2) drawCircle(Color(0xFF38BDF8).copy(alpha = 0.18f), r * k, center, style = Stroke(1.dp.toPx()))
+        // 예외 구역
+        v.zones.forEach { z ->
+            val tl = Offset(z.x * k, z.y * k); val sz = Size(z.w * k, z.h * k)
+            drawRect(Color(0xFF22C55E).copy(alpha = 0.18f), tl, sz)
+            drawRect(Color(0xFF4ADE80).copy(alpha = 0.7f), tl, sz, style = Stroke(1.5.dp.toPx()))
+            drawText(textMeasurer = tm, text = z.name, topLeft = tl + Offset(6.dp.toPx(), 4.dp.toPx()),
+                style = TextStyle(color = Color(0xFFA7F3D0), fontSize = 12.sp, fontWeight = FontWeight.Bold))
+        }
+        // 레이더 위치 (가운데)
+        drawCircle(Color(0xFF38BDF8), 6.dp.toPx(), center)
+        if (offline) {
+            val t = tm.measure(if (l.status == Status.OFFLINE) "센서 연결 끊김" else "센서 확인 중",
+                TextStyle(color = Color.White.copy(alpha = 0.8f), fontSize = 18.sp, fontWeight = FontWeight.Bold))
+            drawText(textLayoutResult = t, topLeft = Offset((size.width - t.size.width) / 2, size.height * 0.68f))
+            return@Canvas
+        }
+        // 지나온 길
+        if (fresh) trail.forEachIndexed { i, p ->
+            drawCircle(dotColor.copy(alpha = 0.10f + 0.35f * i / trail.size), 4.dp.toPx(), Offset(p.x * k, p.y * k))
+        }
+        if (target != null && (fresh || stale)) {
+            val c = Offset(ax * k, ay * k)
+            val a = if (fresh) 1f else 0.35f
+            if (fresh) drawCircle(dotColor.copy(alpha = 0.45f * (1 - pulse)), (14 + 22 * pulse).dp.toPx(), c)
+            drawCircle(Color.White.copy(alpha = a), 15.dp.toPx(), c)
+            drawCircle(dotColor.copy(alpha = a), 11.dp.toPx(), c)
+        } else {
+            val t = tm.measure("감지된 사람 없음", TextStyle(color = Color.White.copy(alpha = 0.6f), fontSize = 17.sp))
+            drawText(textLayoutResult = t, topLeft =Offset((size.width - t.size.width) / 2, size.height * 0.68f))
+        }
+    }
+    val dist = if (l.px != null && l.py != null) kotlin.math.hypot(l.px - v.offX, l.py - v.offY) else null
+    Body(
+        when {
+            offline -> "센서가 연결되면 위치가 보여요."
+            dist != null -> "레이더에서 %.1fm".format(dist) + (l.ph?.let { " · 높이 %.1fm".format(it) } ?: "")
+            stale -> "방금 전 위치예요 (잠깐 놓쳤어요)"
+            else -> "지금은 이 방에서 사람이 잡히지 않아요."
+        }, size = 18
+    )
+}
+
+// ---------------- 위쪽 작은 탭 (요약/레이더, 기록/공지) ----------------
 @Composable
 fun SegTabs(labels: List<String>, sel: Int, onSel: (Int) -> Unit, dot: Int = -1) {
     Row(
