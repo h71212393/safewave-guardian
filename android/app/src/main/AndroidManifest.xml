@@ -11,6 +11,9 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- 긴급 문자: "문자 보내는 폰" 으로 정한 폰만 비상연락처에 문자를 보냄 -->
+    <uses-permission android:name="android.permission.SEND_SMS" />
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
 
     <queries>
         <intent>

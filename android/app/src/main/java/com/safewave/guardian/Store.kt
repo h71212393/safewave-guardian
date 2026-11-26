@@ -29,7 +29,8 @@ data class Live(
     val alarming get() = status == Status.EMERGENCY && !acking
 }
 
-data class Contact(val name: String, val rel: String, val phone: String)
+/** sms: 긴급이면 이 번호로 자동 문자 (관제 사이트 대상자 정보의 "자동 문자" 체크와 같음) */
+data class Contact(val name: String, val rel: String, val phone: String, val sms: Boolean = true)
 
 /** 함께 사는 분 (같은 센서를 씀) */
 data class Person(
@@ -74,8 +75,22 @@ data class RoomView(
 
 /** 집에 있는 레이더 센서 (관제 사이트와 같은 이름) */
 object Rooms {
-    val list = listOf("daegu-102-1" to "거실", "daegu-102-2" to "큰방")
+    val ids = listOf("daegu-102-1", "daegu-102-2")
+    /** 관제 사이트 장치 설정에서 바꾼 이름 (shared/<노드>/name). 없으면 센서1·센서2 */
+    @Volatile var names: Map<String, String> = emptyMap()
+    val list: List<Pair<String, String>> get() = ids.mapIndexed { i, id -> id to (names[id] ?: "센서${i + 1}") }
     fun name(id: String) = list.firstOrNull { it.first == id }?.second ?: id
+
+    /** 앱을 다시 켜도 바로 그 이름이 보이게 휴대폰에 기억 */
+    fun load(ctx: Context) {
+        val s = Prefs(ctx).roomNames ?: return
+        runCatching { val j = JSONObject(s); names = j.keys().asSequence().associateWith { j.getString(it) } }
+    }
+    fun save(ctx: Context, m: Map<String, String>) {
+        if (m == names) return
+        names = m
+        Prefs(ctx).roomNames = JSONObject(m as Map<*, *>).toString()
+    }
 }
 
 object Store {
@@ -92,6 +107,8 @@ object Store {
     /** 방별 상태 (거실·큰방). live 는 이 중 가장 급한 상태 */
     val rooms = MutableStateFlow<Map<String, Live>>(emptyMap())
     val views = MutableStateFlow<Map<String, RoomView>>(emptyMap())
+    /** 방별 "긴급 문자 자동 발송" 스위치 (관제 사이트 장치 설정 · shared/<노드>/settings/sms). 없으면 켜짐 */
+    @Volatile var smsOn: Map<String, Boolean> = emptyMap()
     /** 이번 경보에서 "내가 갈게요" 를 누른 보호자 이름 ("나" 면 이 휴대폰) */
     val goer = MutableStateFlow<String?>(null)
     /** AI 탭 (탭을 오가도 남아 있게 여기 둠) */
@@ -306,6 +323,12 @@ object Store {
     suspend fun refreshShared(ctx: Context) = withContext(Dispatchers.IO) {
         val mainId = Prefs(ctx).node
         val vm = HashMap(views.value)
+        val nm = HashMap<String, String>()
+        val so = HashMap<String, Boolean>()
+        fun nameOf(id: String, doc: JSONObject) {
+            doc.optString("name", "").trim().takeIf { it.isNotEmpty() && it != "null" }?.let { nm[id] = it }
+            doc.optJSONObject("settings")?.let { if (it.has("sms")) so[id] = it.optBoolean("sms", true) }
+        }
         runCatching {
             val body = Db.get(ctx, "/shared/$mainId")
             if (body.trim() == "null") return@runCatching
@@ -315,13 +338,17 @@ object Store {
             val pj = doc.optJSONObject("profile")
             profile.value = (if (pj != null) parseProfile(pj) else profile.value).copy(people = people)
             vm[mainId] = parseView(doc)
+            nameOf(mainId, doc)
         }
-        // 다른 방은 지도 설정만
-        for ((id, _) in Rooms.list) if (id != mainId) runCatching {
+        // 다른 방은 지도 설정·이름만
+        var ok = true
+        for (id in Rooms.ids) if (id != mainId) runCatching {
             val body = Db.get(ctx, "/shared/$id")
-            vm[id] = if (body.trim() == "null") RoomView() else parseView(JSONObject(body))
-        }
+            if (body.trim() == "null") vm[id] = RoomView()
+            else { val d = JSONObject(body); vm[id] = parseView(d); nameOf(id, d) }
+        }.onFailure { ok = false }
         views.value = vm
+        if (ok) { Rooms.save(ctx, nm); smsOn = so; recompute() }   // 이름이 바뀌면 방 상태에도 바로
     }
 
     private fun parseView(doc: JSONObject): RoomView {
@@ -403,7 +430,7 @@ object Store {
             val c = arr.optJSONObject(i) ?: continue
             val name = c.optString("name").trim()
             val phone = c.optString("phone").trim()
-            if (name.isNotEmpty() || phone.isNotEmpty()) cs += Contact(name, c.optString("rel").trim(), phone)
+            if (name.isNotEmpty() || phone.isNotEmpty()) cs += Contact(name, c.optString("rel").trim(), phone, c.optBoolean("sms", true))
         }
         fun s(k: String) = j.opt(k)?.takeIf { it != JSONObject.NULL }?.toString()?.trim().orEmpty()
         return Profile(
@@ -421,7 +448,7 @@ object Store {
         try {
             val nodeId = Prefs(ctx).node
             val contacts = JSONArray()
-            np.contacts.forEach { contacts.put(JSONObject().put("name", it.name).put("rel", it.rel).put("phone", it.phone)) }
+            np.contacts.forEach { contacts.put(JSONObject().put("name", it.name).put("rel", it.rel).put("phone", it.phone).put("sms", it.sms)) }
             val pj = JSONObject()
                 .put("name", np.name).put("age", np.age.trim().toIntOrNull() ?: np.age.trim())
                 .put("sex", np.sex).put("blood", np.blood).put("addr", np.addr).put("cond", np.cond)

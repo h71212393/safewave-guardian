@@ -103,10 +103,18 @@ class MainActivity : ComponentActivity() {
     private val needBattery = mutableStateOf(false)
 
     private val notifPerm = registerForActivityResult(ActivityResultContracts.RequestPermission()) { checkPerms() }
+    // 긴급 문자: "이 폰에서 문자 보내기" 를 켜면 문자 권한을 물어봄. 허용해야 켜짐
+    private val smsSenderState = mutableStateOf(false)
+    private val smsPerm = registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+        Prefs(this).smsSender = ok
+        smsSenderState.value = ok
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WatchService.channels(this)
+        Rooms.load(this)
+        smsSenderState.value = SmsAlert.active(this)
         Store.fontLevel.value = Prefs(this).fontLevel
         handleOpen(intent)
         setContent {
@@ -377,7 +385,14 @@ class MainActivity : ComponentActivity() {
                         onSound = { sound = it; Prefs(ctx).alarmSound = it },
                         onTest = { WatchService.start(ctx); Store.testAlarm.value = true },
                         onNotify = ::openNotifySettings, onFullScreen = ::openFullScreenSettings,
-                        onBattery = ::openBatterySettings, onLogout = ::logout
+                        onBattery = ::openBatterySettings, onLogout = ::logout,
+                        smsSender = smsSenderState.value, smsTargets = SmsAlert.targets(),
+                        onSmsSender = { on ->
+                            if (!on) { Prefs(ctx).smsSender = false; smsSenderState.value = false }
+                            else if (SmsAlert.permitted(ctx)) { Prefs(ctx).smsSender = true; smsSenderState.value = true }
+                            else smsPerm.launch(Manifest.permission.SEND_SMS)
+                        },
+                        onSmsTest = { done -> scope.launch { done(SmsAlert.test(ctx)) } }
                     )
                 }
             }

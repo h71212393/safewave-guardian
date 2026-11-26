@@ -277,7 +277,7 @@ fun CallScreen(
         list.forEachIndexed { i, c ->
             if (editing == i) {
                 ContactForm("${i + 1}순위 연락처 고치기", c, busy,
-                    onSave = { nc -> save(list.toMutableList().also { it[i] = nc }, "연락처를 고쳤어요. 관제 사이트에도 반영돼요.") },
+                    onSave = { nc -> save(list.toMutableList().also { it[i] = nc.copy(sms = c.sms) }, "연락처를 고쳤어요. 관제 사이트에도 반영돼요.") },
                     onCancel = { editing = -2 })
             } else Card {
                 Text("${i + 1}순위 · ${c.rel.ifEmpty { "연락처" }}", fontSize = 18.sp, color = C.sub, fontWeight = FontWeight.SemiBold)
@@ -558,8 +558,13 @@ fun SettingsScreen(
     me: Me?, fontLevel: Int, voice: Boolean, sound: Boolean, node: String, flipGuide: Boolean, onFlipGuide: (Boolean) -> Unit,
     needNotify: Boolean, needFullScreen: Boolean, needBattery: Boolean,
     onFont: (Int) -> Unit, onVoice: (Boolean) -> Unit, onSound: (Boolean) -> Unit,
-    onTest: () -> Unit, onNotify: () -> Unit, onFullScreen: () -> Unit, onBattery: () -> Unit, onLogout: () -> Unit
+    onTest: () -> Unit, onNotify: () -> Unit, onFullScreen: () -> Unit, onBattery: () -> Unit, onLogout: () -> Unit,
+    smsSender: Boolean = false, smsTargets: List<Contact> = emptyList(),
+    onSmsSender: (Boolean) -> Unit = {}, onSmsTest: ((String) -> Unit) -> Unit = {}
 ) {
+    var smsArm by remember { mutableStateOf(false) }
+    var smsBusy by remember { mutableStateOf(false) }
+    var smsMsg by remember { mutableStateOf("") }
     Page {
         Title("설정")
         Card {
@@ -582,6 +587,28 @@ fun SettingsScreen(
             SwitchRow("경보음 울리기", "긴급일 때 큰 소리로 울려요", sound, onSound)
             BigButton("경보 시험하기", onTest, outlined = true, contentColor = C.crit, icon = Icons.Default.Notifications)
             Body("시험 경보는 이 휴대폰에서만 울리고, 다른 사람에게는 가지 않아요.", size = 17)
+        }
+        Card {
+            Text("긴급 문자 자동 발송", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = C.ink)
+            SwitchRow("이 폰에서 문자 보내기", "긴급이면 이 폰 번호로 비상연락처에 문자를 보내요", smsSender) { smsMsg = ""; onSmsSender(it) }
+            Body(
+                if (smsTargets.isEmpty()) "받을 사람이 없어요. 비상연락처에 휴대폰 번호를 넣고 '자동 문자'를 켜 주세요."
+                else "받는 사람: " + smsTargets.joinToString(", ") { it.name.ifEmpty { it.phone } },
+                color = if (smsTargets.isEmpty()) C.crit else C.ink, size = 19
+            )
+            Body("팀에서 안드로이드 폰 한 대만 켜 주세요. 문자 요금은 이 폰 요금제로 나가요. 관제 사이트 장치 설정의 '긴급 문자 자동 발송'이 꺼져 있으면 보내지 않아요.", size = 16)
+            if (smsSender) {
+                BigButton(
+                    when { smsBusy -> "보내는 중..."; smsArm -> "한 번 더 누르면 보내요"; else -> "시험 문자 보내기" },
+                    {
+                        if (!smsArm) smsArm = true
+                        else { smsArm = false; smsBusy = true; onSmsTest { smsBusy = false; smsMsg = it } }
+                    },
+                    outlined = !smsArm, color = C.crit, contentColor = if (smsArm) Color.White else C.crit,
+                    icon = Icons.Default.Phone, enabled = !smsBusy && smsTargets.isNotEmpty()
+                )
+            }
+            if (smsMsg.isNotEmpty()) Body(smsMsg, color = if (smsMsg.startsWith("시험 문자를 보냈")) C.ok else C.crit, size = 18)
         }
         if (flipGuide) Card {
             Text("갤럭시 플립 커버 화면", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = C.ink)

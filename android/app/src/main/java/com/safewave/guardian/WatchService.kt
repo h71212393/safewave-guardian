@@ -112,6 +112,7 @@ class WatchService : Service() {
     override fun onCreate() {
         super.onCreate()
         channels(this)
+        Rooms.load(this)
         val type = if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
         ServiceCompat.startForeground(this, N_WATCH, watchNotification("센서와 연결하는 중이에요"), type)
 
@@ -231,6 +232,7 @@ class WatchService : Service() {
                                 else if (Store.profile.value.people.isNotEmpty()) "긴급 상황입니다. ${name()} 님 댁 ${where()}낙상이 감지되었습니다. 확인해 주세요."
                                 else "긴급 상황입니다. ${name()} 님이 ${where()}넘어지셨습니다. 확인해 주세요."
                     speak(words)
+                    if (!test) scope.launch { SmsAlert.emergency(this@WatchService, l) }   // "문자 보내는 폰" 이면 비상연락처에 문자
                     startAlarm(if (Prefs(this).voice) 6_000L else 3_000L)
                     openOnCoverIfFolded()
                     if (test) scope.launch { delay(20_000); Store.testAlarm.value = false }
@@ -245,6 +247,7 @@ class WatchService : Service() {
                     stopAlarm()
                     nm.cancel(N_ALERT)
                     if (prev == "emergency" && (l.status == Status.NORMAL || l.status == Status.EMPTY)) speak("알람이 해제되었습니다.")
+                    if (l.status == Status.NORMAL || l.status == Status.EMPTY) scope.launch { SmsAlert.cleared(this@WatchService) }
                 }
             }
         } else if (key == "grace") {

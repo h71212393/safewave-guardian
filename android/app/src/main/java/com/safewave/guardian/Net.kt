@@ -56,6 +56,16 @@ class Prefs(ctx: Context) {
         get() = p.getLong("noticeNotified", 0L)
         set(v) { p.edit().putLong("noticeNotified", v).apply() }
 
+    /** 이 폰이 "문자 보내는 폰" 인지 (긴급이면 이 폰 번호로 비상연락처에 문자) */
+    var smsSender: Boolean
+        get() = p.getBoolean("smsSender", false)
+        set(v) { p.edit().putBoolean("smsSender", v).apply() }
+
+    /** 센서 이름 {노드: 이름} (JSON) */
+    var roomNames: String?
+        get() = p.getString("roomNames", null)
+        set(v) { p.edit().putString("roomNames", v).apply() }
+
     fun clearSession() {
         p.edit().remove("uid").remove("email").remove("rt").remove("name").apply()
     }
