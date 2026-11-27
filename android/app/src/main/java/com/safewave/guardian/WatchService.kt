@@ -101,6 +101,7 @@ class WatchService : Service() {
     private val wasOnline = HashMap<String, Boolean>()
     private var lastGoer: String? = null
     private var player: MediaPlayer? = null
+    private var voicePlayer: MediaPlayer? = null   // 녹음한 안내 음성
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var wake: PowerManager.WakeLock? = null
@@ -179,6 +180,7 @@ class WatchService : Service() {
         scope.cancel()
         streams.forEach { it.stop() }
         stopAlarm()
+        stopVoice()
         runCatching { tts?.shutdown() }
         getSystemService(NotificationManager::class.java).cancel(N_ALERT)
         super.onDestroy()
@@ -231,29 +233,30 @@ class WatchService : Service() {
                     val words = if (test) "시험 경보입니다. 실제 상황이 아닙니다."
                                 else if (Store.profile.value.people.isNotEmpty()) "긴급 상황입니다. ${name()} 님 댁 ${where()}낙상이 감지되었습니다. 확인해 주세요."
                                 else "긴급 상황입니다. ${name()} 님이 ${where()}넘어지셨습니다. 확인해 주세요."
-                    speak(words)
+                    val voiced = if (test) { speak(words); false } else playVoice(R.raw.sw_emergency, words)   // 녹음한 위험 안내 (중앙 스피커와 같은 목소리)
                     if (!test) scope.launch { SmsAlert.emergency(this@WatchService, l) }   // "문자 보내는 폰" 이면 비상연락처에 문자
-                    startAlarm(if (Prefs(this).voice) 6_000L else 3_000L)
+                    startAlarm(if (!Prefs(this).voice) 3_000L else if (voiced) 9_000L else 6_000L)   // 안내(약 8초)가 끝난 뒤 경보음
                     openOnCoverIfFolded()
                     if (test) scope.launch { delay(20_000); Store.testAlarm.value = false }
                 }
                 "grace" -> {
                     stopAlarm()
                     nm.notify(N_ALERT, graceNotification(l))
-                    speak(if (Store.profile.value.people.isNotEmpty()) "${name()} 님 댁 ${where()}낙상이 의심됩니다. 지금 확인하고 있습니다."
-                          else "${name()} 님이 ${where()}넘어지신 것 같습니다. 지금 확인하고 있습니다.")
+                    playVoice(R.raw.sw_grace, if (Store.profile.value.people.isNotEmpty()) "${name()} 님 댁 ${where()}낙상이 의심됩니다. 지금 확인하고 있습니다."
+                          else "${name()} 님이 ${where()}넘어지신 것 같습니다. 지금 확인하고 있습니다.")   // 녹음한 경고 안내
                 }
                 else -> {
                     stopAlarm()
                     nm.cancel(N_ALERT)
-                    if (prev == "emergency" && (l.status == Status.NORMAL || l.status == Status.EMPTY)) speak("알람이 해제되었습니다.")
+                    if (prev == "grace") stopVoice()   // 유예 중 바로 괜찮아지면 안내를 멈춤
+                    if (prev == "emergency" && (l.status == Status.NORMAL || l.status == Status.EMPTY)) playVoice(R.raw.sw_cleared, "알람이 해제되었습니다.")
                     if (l.status == Status.NORMAL || l.status == Status.EMPTY) scope.launch { SmsAlert.cleared(this@WatchService) }
                 }
             }
         } else if (key == "grace") {
             nm.notify(N_ALERT, graceNotification(l))   // 남은 시간 갱신
         }
-        if (silenced) stopAlarm()
+        if (silenced) { stopAlarm(); if (key == "emergency") stopVoice() }
         StatusWidget.update(this)
     }
 
@@ -367,6 +370,36 @@ class WatchService : Service() {
     private fun speak(text: String) {
         if (!Prefs(this).voice || !ttsReady) return
         runCatching { tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "sw-${System.currentTimeMillis()}") }
+    }
+
+    /** 녹음한 안내 음성 재생 (res/raw). 재생 못 하면 같은 내용을 TTS 로. 재생했으면 true */
+    private fun playVoice(resId: Int, fallback: String): Boolean {
+        if (!Prefs(this).voice) return false
+        stopVoice()
+        runCatching { tts?.stop() }
+        val ok = runCatching {
+            voicePlayer = MediaPlayer().apply {
+                setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ALARM)   // 무음 모드여도 들리게 (경보와 같은 음량)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                resources.openRawResourceFd(resId).use { fd -> setDataSource(fd.fileDescriptor, fd.startOffset, fd.length) }
+                setOnCompletionListener { stopVoice() }
+                prepare()
+                start()
+            }
+        }.isSuccess
+        if (!ok) { stopVoice(); speak(fallback) }
+        return ok
+    }
+
+    private fun stopVoice() {
+        val p = voicePlayer ?: return
+        voicePlayer = null
+        runCatching { p.stop() }
+        runCatching { p.release() }
     }
 
     private fun startAlarm(delayMs: Long) {
